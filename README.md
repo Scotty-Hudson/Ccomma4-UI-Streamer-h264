@@ -1,6 +1,6 @@
 # Comma4-UI-Streamer
 
-Stream your comma 4's live openpilot/sunnypilot UI to any browser on your local network via MJPEG.
+Stream your comma 4's live openpilot/sunnypilot UI to any browser on your local network via MJPEG. Runs at 10 FPS by default (configurable).
 
 ![comma 4](https://img.shields.io/badge/comma-4-blue) ![openpilot](https://img.shields.io/badge/openpilot-compatible-blue) ![sunnypilot](https://img.shields.io/badge/sunnypilot-compatible-green)
 
