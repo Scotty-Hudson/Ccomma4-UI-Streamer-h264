@@ -2,7 +2,7 @@
 
 Stream your comma 4's live openpilot/sunnypilot UI to any browser on your local network via MJPEG.
 
-![comma 4](https://img.shields.io/badge/comma-4-blue) ![sunnypilot](https://img.shields.io/badge/sunnypilot-staging--c4-green)
+![comma 4](https://img.shields.io/badge/comma-4-blue) ![openpilot](https://img.shields.io/badge/openpilot-compatible-blue) ![sunnypilot](https://img.shields.io/badge/sunnypilot-compatible-green)
 
 ## What you get
 
@@ -100,6 +100,12 @@ http://<comma-ip>:8082
 Edit these in `ui_stream.py` → `capture_frame()` and `start()` calls.
 
 ---
+
+## Compatibility
+
+Works with both **openpilot** and **sunnypilot** — both use the same `pyray`-based UI framework (`system/ui/lib/application.py`). The hook point is identical.
+
+> The auto-patch script may need minor adjustments depending on your exact branch/version. The manual injection step always works as a fallback.
 
 ## Tested on
 
