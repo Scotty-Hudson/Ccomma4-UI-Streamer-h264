@@ -31,7 +31,7 @@ Your phone/browser must be on the **same wifi network** as your comma (or connec
 
 ## Setup
 
-sunnypilot already has the stream hook built into `system/ui/lib/application.py` — you just need to drop in the stream server and enable it.
+sunnypilot / openpilot already has the stream hook built into `system/ui/lib/application.py` — you just need to drop in the stream server and enable it.
 
 ### Step 1 — SSH into your comma
 
