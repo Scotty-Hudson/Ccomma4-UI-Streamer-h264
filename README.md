@@ -50,6 +50,26 @@ That's it. No patching required — sunnypilot's UI framework automatically impo
 
 ---
 
+## Mobile — Add to Home Screen
+
+Works best on phones and tablets when added as a web app. This gives you a fullscreen, app-like experience with no browser chrome.
+
+**iOS (Safari):**
+1. Open `http://<comma-ip>:8082` in Safari
+2. Tap the **Share** button (square with arrow)
+3. Scroll down and tap **Add to Home Screen**
+4. Tap **Add**
+
+**Android (Chrome):**
+1. Open `http://<comma-ip>:8082` in Chrome
+2. Tap the **⋮** menu (top right)
+3. Tap **Add to Home Screen** (or **Install app**)
+4. Tap **Add**
+
+The stream will now open as a standalone app — no address bar, no tabs, just the live UI.
+
+---
+
 ## Configuration
 
 Set these environment variables in `launch_env.sh`:
