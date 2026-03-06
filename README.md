@@ -58,7 +58,7 @@ Then open in your browser:
 http://<comma-ip>:8082
 ```
 
-That's it. No patching required — sunnypilot's UI framework automatically imports `/data/ui_stream.py` when `STREAM=1` is set.
+That's it. No patching required — openpilot and sunnypilot's UI framework automatically imports `/data/ui_stream.py` when `STREAM=1` is set.
 
 ---
 
