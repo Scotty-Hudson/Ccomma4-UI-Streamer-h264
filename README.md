@@ -106,28 +106,7 @@ export STREAM_FPS=15
 
 ## How it works
 
-```
-sunnypilot UI (raylib) → render texture → RGBA readback → JPEG encode → MJPEG HTTP
-                                                                            ↓
-               /tmp/telemetry.json ← ui_state.py patch ← cereal topics → overlay
-```
-
-1. `application.py` checks for `STREAM=1` at startup and imports `ui_stream.py` from `/data/`
-2. Each render frame, `capture_frame()` reads the raylib render texture
-3. Converts RGBA → RGB JPEG at the configured quality
-4. Pushes to connected MJPEG clients via HTTP multipart stream
-5. Telemetry overlay polls `/telemetry` (backed by a patch to `ui_state.py`) for live vehicle data
-
-### Telemetry data sources
-
-| Data | Source |
-|------|--------|
-| Speed, steering, gas/brake | `carState`, `carOutput` |
-| Lead car distance & speed | `radarState.leadOne` |
-| Road grade & pitch | `liveLocationKalman` (GPS+IMU fusion) |
-| Model exec time, frame drops | `modelV2` |
-| CPU temp, CPU/memory usage | `deviceState` |
-| Engage state (incl. MADS) | `selfdriveState`, `selfdriveStateSP` |
+The UI process captures each rendered frame as a JPEG and serves it over HTTP as an MJPEG stream. The telemetry overlay reads live vehicle data from a small patch to `ui_state.py` and displays it on top of the video feed.
 
 ---
 
