@@ -45,8 +45,12 @@ ssh comma@<your-comma-ip>
 # Download the stream server
 curl -sL https://raw.githubusercontent.com/peterclampton/Comma4-UI-Streamer/main/ui_stream.py -o /data/ui_stream.py
 
-# Enable streaming on boot
-echo 'export STREAM=1' >> /data/openpilot/launch_env.sh
+# Download the persistence script (survives sunnypilot updates)
+curl -sL https://raw.githubusercontent.com/peterclampton/Comma4-UI-Streamer/main/ensure_stream.sh -o /data/ensure_stream.sh
+chmod +x /data/ensure_stream.sh
+
+# Run it once to enable streaming and install the boot service
+sudo /data/ensure_stream.sh
 
 # Reboot to activate
 sudo reboot
@@ -59,6 +63,19 @@ http://<comma-ip>:8082
 ```
 
 That's it. No patching required — openpilot and sunnypilot's UI framework automatically imports `/data/ui_stream.py` when `STREAM=1` is set.
+
+### Why `ensure_stream.sh`?
+
+Sunnypilot updates run `git reset --hard`, which wipes any changes to `launch_env.sh` — including `STREAM=1`. The `ensure_stream.sh` script solves this by:
+
+1. Re-injecting `STREAM=1` into `launch_env.sh` if it's missing
+2. Installing a systemd service that runs this check on every boot, **before** openpilot starts
+
+Your stream will survive sunnypilot updates automatically. After an AGNOS update (rare — a few times a year), just re-run:
+
+```bash
+sudo /data/ensure_stream.sh
+```
 
 ---
 
@@ -84,7 +101,7 @@ The stream will now open as a standalone app — no browser bar, no tabs, just t
 
 ## Configuration
 
-Set these environment variables in `launch_env.sh`:
+Set these environment variables in `launch_env.sh` (or edit the defaults in `ensure_stream.sh`):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -107,6 +124,26 @@ export STREAM_FPS=15
 ## How it works
 
 The UI process captures each rendered frame as a JPEG and serves it over HTTP as an MJPEG stream. The telemetry overlay reads live vehicle data from a small patch to `ui_state.py` and displays it on top of the video feed.
+
+---
+
+## Uninstall
+
+```bash
+# Remove the stream server and persistence script
+rm /data/ui_stream.py /data/ensure_stream.sh
+
+# Remove STREAM vars from launch_env.sh
+sed -i '/^export STREAM/d' /data/openpilot/launch_env.sh
+
+# Remove the boot service
+sudo mount -o remount,rw /
+sudo systemctl disable ensure-stream.service
+sudo rm /etc/systemd/system/ensure-stream.service
+sudo systemctl daemon-reload
+
+sudo reboot
+```
 
 ---
 
