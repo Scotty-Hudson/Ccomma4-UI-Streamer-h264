@@ -11,7 +11,7 @@ Stream your comma 4's live sunnypilot/openpilot UI to any browser on your local 
 Open `http://<comma-ip>:8082` on your phone, infotainment screen, or any browser — and see the comma UI live with full HUD overlay (lane lines, lead car, speed, alerts) plus real-time telemetry data.
 
 **Live overlay includes:**
-- Set speed, engage status (Engaged / Standby)
+- Set speed, engage status (Engaged / Standby / Steering with sunnypilot MADS)
 - Lead car distance (ft) and gap time (seconds) — appears when a lead car is detected and self-driving is active
 - Acceleration bar, gas/brake output
 - Road grade (%)
