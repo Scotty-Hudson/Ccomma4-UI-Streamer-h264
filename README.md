@@ -66,7 +66,7 @@ That's it. No patching required — openpilot and sunnypilot's UI framework auto
 
 ### Why `ensure_stream.sh`?
 
-Sunnypilot updates replace `/data/openpilot/` with a clean copy, which wipes any changes to `launch_env.sh` — including `STREAM=1`. The `ensure_stream.sh` script solves this by:
+sunnypilot / openpilot updates replace `/data/openpilot/` with a clean copy, which wipes any changes to `launch_env.sh` — including `STREAM=1`. The `ensure_stream.sh` script solves this by:
 
 1. Re-injecting `STREAM=1` into `launch_env.sh` if it's missing
 2. Installing a systemd service that runs this check on every boot, **before** openpilot starts
