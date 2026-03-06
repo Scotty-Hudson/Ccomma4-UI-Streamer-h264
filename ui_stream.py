@@ -80,7 +80,6 @@ body{background:#000;overflow:hidden;height:100vh;width:100vw;margin:0;font-fami
 #accel-bar-pos{height:100%;width:0;background:#4caf50;position:absolute;left:50%;border-radius:0 6px 6px 0;transition:width 0.1s}
 #accel-center{position:absolute;left:50%;top:0;bottom:0;width:2px;background:rgba(255,255,255,0.4);transform:translateX(-50%);z-index:1}
 #accel-num{font-size:min(4vw,18px);color:#aaa;margin-top:1px}
-#m-cpu{right:6%;top:10%;font-size:min(2vw,10px)}
 
 /* Brake/Gas indicators */
 #pedals{position:absolute;bottom:15%;left:1%;display:flex;gap:10px;align-items:flex-end}
@@ -93,9 +92,9 @@ body{background:#000;overflow:hidden;height:100vh;width:100vw;margin:0;font-fami
 #perf-strip{position:absolute;bottom:1%;left:50%;transform:translateX(-50%);display:flex;gap:min(3vw,14px);background:rgba(0,0,0,0.5);padding:3px 10px;border-radius:6px}
 .pf{text-align:center}
 .pf-label{font-size:min(1.8vw,8px);color:#666;letter-spacing:0.5px}
-.pf-val{font-size:min(2.5vw,12px);color:#888;font-weight:500}
-.pf-val.warn{color:#ff9800}
+.pf-val{font-size:min(2.5vw,12px);color:#e0e0e0;font-weight:500}
 .pf-val.bad{color:#f44336}
+
 </style></head><body>
 <div id="wrap">
   <img id="cam" src="/stream">
@@ -125,7 +124,6 @@ body{background:#000;overflow:hidden;height:100vh;width:100vw;margin:0;font-fami
       </div>
       <div id="accel-num">0.0</div>
     </div>
-    <div class="metric" id="m-cpu"><div class="val" id="cpu-val">--&deg;</div>cpu</div>
 
     <div class="metric" id="m-grade"><div class="val" id="grade-val">--%</div>grade</div>
     <div id="pedals">
@@ -137,6 +135,7 @@ body{background:#000;overflow:hidden;height:100vh;width:100vw;margin:0;font-fami
       <div class="pf"><div class="pf-label">DROPS</div><div class="pf-val" id="pf-drops">--</div></div>
       <div class="pf"><div class="pf-label">CPU</div><div class="pf-val" id="pf-cpu">--</div></div>
       <div class="pf"><div class="pf-label">MEM</div><div class="pf-val" id="pf-mem">--</div></div>
+      <div class="pf"><div class="pf-label">CPU TEMP</div><div class="pf-val" id="pf-temp">--</div></div>
     </div>
   </div>
 </div>
@@ -188,7 +187,7 @@ function poll() {
     document.getElementById('accel-num').textContent = a.toFixed(1) + ' m/s2';
 
     // CPU
-    if (d.cpuTemp > 0) document.getElementById('cpu-val').textContent = d.cpuTemp + String.fromCharCode(176);
+    if (d.cpuTemp !== undefined) { var e=document.getElementById("pf-temp"); e.textContent=d.cpuTemp+String.fromCharCode(176); e.className="pf-val"+(d.cpuTemp>80?" bad":""); }
 
     // Gas/Brake bars
     if (d.grade !== undefined) document.getElementById('grade-val').textContent = d.grade + '%';
@@ -196,10 +195,10 @@ function poll() {
     document.getElementById('gas-val').textContent = d.gas;
     document.getElementById('brake-bar').style.height = Math.max(2, d.brake * 0.6) + 'px';
     document.getElementById('brake-val').textContent = d.brake;
-    if (d.modelExec !== undefined) { var e=document.getElementById("pf-model"); e.textContent=d.modelExec+"ms"; e.className="pf-val"+(d.modelExec>35?" bad":d.modelExec>25?" warn":""); }
-    if (d.frameDropPerc !== undefined) { var e=document.getElementById("pf-drops"); e.textContent=d.frameDropPerc+"%"; e.className="pf-val"+(d.frameDropPerc>5?" bad":d.frameDropPerc>1?" warn":""); }
-    if (d.cpuUsage !== undefined) { var e=document.getElementById("pf-cpu"); e.textContent=d.cpuUsage+"%"; e.className="pf-val"+(d.cpuUsage>80?" bad":d.cpuUsage>60?" warn":""); }
-    if (d.memUsed !== undefined) { var e=document.getElementById("pf-mem"); e.textContent=d.memUsed+"%"; e.className="pf-val"+(d.memUsed>80?" bad":d.memUsed>60?" warn":""); }
+    if (d.modelExec !== undefined) { var e=document.getElementById("pf-model"); e.textContent=d.modelExec+"ms"; e.className="pf-val"+(d.modelExec>35?" bad":""); }
+    if (d.frameDropPerc !== undefined) { var e=document.getElementById("pf-drops"); e.textContent=d.frameDropPerc+"%"; e.className="pf-val"+(d.frameDropPerc>5?" bad":""); }
+    if (d.cpuUsage !== undefined) { var e=document.getElementById("pf-cpu"); e.textContent=d.cpuUsage+"%"; e.className="pf-val"+(d.cpuUsage>85?" bad":""); }
+    if (d.memUsed !== undefined) { var e=document.getElementById("pf-mem"); e.textContent=d.memUsed+"%"; e.className="pf-val"+(d.memUsed>85?" bad":""); }
 
   }).catch(() => {});
   setTimeout(poll, 250);
