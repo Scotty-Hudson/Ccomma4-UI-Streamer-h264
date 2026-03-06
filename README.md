@@ -8,12 +8,20 @@ Stream your comma 4's live sunnypilot/openpilot UI to any browser on your local 
 
 ## What you get
 
-Open `http://<comma-ip>:8082` on your phone, infotainment screen, or any browser — and see the comma UI live with full HUD overlay (lane lines, lead car, speed, alerts).
+Open `http://<comma-ip>:8082` on your phone, infotainment screen, or any browser — and see the comma UI live with full HUD overlay (lane lines, lead car, speed, alerts) plus real-time telemetry data.
+
+**Live overlay includes:**
+- Set speed, engage status (Engaged / Standby)
+- Lead car distance (ft) and gap time (seconds)
+- Acceleration bar, gas/brake output
+- Road grade (%), CPU temperature
+- Performance monitoring — model exec time, frame drops, CPU & memory usage
 
 **Endpoints:**
-- `/` — fullscreen viewer page
+- `/` — fullscreen viewer with telemetry overlay
 - `/stream` — raw MJPEG stream
 - `/snapshot` — grab a single frame
+- `/telemetry` — live telemetry JSON
 
 ---
 
@@ -100,12 +108,26 @@ export STREAM_FPS=15
 
 ```
 sunnypilot UI (raylib) → render texture → RGBA readback → JPEG encode → MJPEG HTTP
+                                                                            ↓
+               /tmp/telemetry.json ← ui_state.py patch ← cereal topics → overlay
 ```
 
 1. `application.py` checks for `STREAM=1` at startup and imports `ui_stream.py` from `/data/`
 2. Each render frame, `capture_frame()` reads the raylib render texture
 3. Converts RGBA → RGB JPEG at the configured quality
 4. Pushes to connected MJPEG clients via HTTP multipart stream
+5. Telemetry overlay polls `/telemetry` (backed by a patch to `ui_state.py`) for live vehicle data
+
+### Telemetry data sources
+
+| Data | Source |
+|------|--------|
+| Speed, steering, gas/brake | `carState`, `carOutput` |
+| Lead car distance & speed | `radarState.leadOne` |
+| Road grade & pitch | `liveLocationKalman` (GPS+IMU fusion) |
+| Model exec time, frame drops | `modelV2` |
+| CPU temp, CPU/memory usage | `deviceState` |
+| Engage state (incl. MADS) | `selfdriveState`, `selfdriveStateSP` |
 
 ---
 
