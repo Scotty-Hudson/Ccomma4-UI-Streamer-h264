@@ -10,7 +10,7 @@
 
 set -e
 
-STREAM_REPO="https://raw.githubusercontent.com/peterclampton/Comma4-UI-Streamer/main"
+STREAM_REPO="https://raw.githubusercontent.com/Scotty-Hudson/Ccomma4-UI-Streamer-h264/h264"
 
 # ---------- 1. Patch launch_env.sh with STREAM env vars ----------
 

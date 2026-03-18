@@ -41,9 +41,9 @@ ssh comma@<your-comma-ip>
 
 ```bash
 # Download all files
-curl -sL https://raw.githubusercontent.com/peterclampton/Comma4-UI-Streamer/main/ui_stream.py -o /data/ui_stream.py
-curl -sL https://raw.githubusercontent.com/peterclampton/Comma4-UI-Streamer/main/stream_patch.py -o /data/stream_patch.py
-curl -sL https://raw.githubusercontent.com/peterclampton/Comma4-UI-Streamer/main/ensure_stream.sh -o /data/ensure_stream.sh
+curl -sL https://raw.githubusercontent.com/Scotty-Hudson/Ccomma4-UI-Streamer-h264/h264/ui_stream.py -o /data/ui_stream.py
+curl -sL https://raw.githubusercontent.com/Scotty-Hudson/Ccomma4-UI-Streamer-h264/h264/stream_patch.py -o /data/stream_patch.py
+curl -sL https://raw.githubusercontent.com/Scotty-Hudson/Ccomma4-UI-Streamer-h264/h264/ensure_stream.sh -o /data/ensure_stream.sh
 chmod +x /data/ensure_stream.sh
 
 # Run it (patches application.py, sets env vars, installs boot service)
