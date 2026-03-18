@@ -1,6 +1,6 @@
 # Comma4-UI-Streamer
 
-Stream your comma 4's live sunnypilot/openpilot UI to any browser on your local network via MJPEG.
+Stream your comma 4's live sunnypilot/openpilot UI to any browser on your local network via WebRTC (H.264 preferred).
 
 ![comma 4](https://img.shields.io/badge/comma-4-blue) ![openpilot](https://img.shields.io/badge/openpilot-compatible-blue) ![sunnypilot](https://img.shields.io/badge/sunnypilot-compatible-green)
 
@@ -8,7 +8,7 @@ Stream your comma 4's live sunnypilot/openpilot UI to any browser on your local 
 
 ## What you get
 
-Open `http://<comma-ip>:8082` on your phone, infotainment screen, or any browser — and see the comma UI live with full HUD overlay (lane lines, lead car, speed, alerts) plus real-time telemetry data.
+Open `http://<comma-ip>:8082` on your phone, infotainment screen, or any browser — and see the comma UI live with full HUD overlay (lane lines, lead car, speed, alerts) plus real-time telemetry data. Video is delivered via WebRTC with H.264 codec preference for low-latency, bandwidth-efficient streaming.
 
 **Live overlay includes:**
 - Set speed, engage status (Engaged / Standby / Steering with sunnypilot MADS)
@@ -18,16 +18,16 @@ Open `http://<comma-ip>:8082` on your phone, infotainment screen, or any browser
 - Performance monitoring — model exec time, frame drops, CPU temperature & memory usage
 
 **Endpoints:**
-- `/` — fullscreen viewer with telemetry overlay
-- `/stream` — raw MJPEG stream
-- `/snapshot` — grab a single frame
+- `/` — fullscreen viewer with telemetry overlay (WebRTC video)
+- `/offer` — WebRTC signaling (POST SDP offer, receive SDP answer)
+- `/snapshot` — grab a single JPEG frame
 - `/telemetry` — live telemetry JSON
 
 ---
 
 ## Requirements
 
-Your phone/browser must be on the **same wifi network** as your comma (or connected via USB tether).
+Your phone/browser must be on the **same wifi network** as your comma (or connected via USB tether). A modern browser with WebRTC support is required (Chrome, Firefox, Safari, Edge).
 
 ## Setup
 
@@ -127,9 +127,9 @@ export STREAM_FPS=15
 The installer patches `application.py` to:
 1. Import `/data/ui_stream.py` when `STREAM=1` is set
 2. Create a render texture for frame capture (if one doesn't already exist)
-3. Capture each rendered frame as JPEG and serve it over HTTP as an MJPEG stream
+3. Capture each rendered frame as an RGB array and feed it to a WebRTC video track
 
-The telemetry overlay reads live vehicle data from `/tmp/telemetry.json` (written by a small patch to `ui_state.py`) and displays it on top of the video feed in the browser.
+When a browser connects, it negotiates a WebRTC peer connection via the `/offer` endpoint. The SDP answer is manipulated to prefer H.264, giving you hardware-friendly, low-latency video with minimal bandwidth. The telemetry overlay reads live vehicle data from `/tmp/telemetry.json` and displays it on top of the video feed in the browser.
 
 ---
 
@@ -176,7 +176,7 @@ sudo reboot
 
 - **Hardware:** comma 4 (Snapdragon 845)
 - **Software:** sunnypilot and openpilot — both use the same `pyray`-based UI framework
-- **Browsers:** Safari (iOS), Chrome, Firefox — any browser that supports MJPEG
+- **Browsers:** Safari (iOS), Chrome, Firefox, Edge — any browser with WebRTC support
 
 ## Tested on
 

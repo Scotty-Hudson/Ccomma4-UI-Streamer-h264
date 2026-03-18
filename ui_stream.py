@@ -1,44 +1,124 @@
-"""MJPEG stream server for sunnypilot UI with telemetry overlay.
+"""WebRTC stream server (H.264 preferred) for sunnypilot UI with telemetry overlay.
 Imported lazily when STREAM=1."""
 import threading
 import io
 import os
+import asyncio
+
 import json
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from socketserver import ThreadingMixIn
 
-class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
-    daemon_threads = True
-
+import numpy as np
+from aiohttp import web
+from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack
+from av import VideoFrame
 from PIL import Image
 import pyray as rl
 
 
-class StreamState:
-    def __init__(self):
-        self.frame = b""
-        self.lock = threading.Lock()
-        self.event = threading.Event()
+# ---------------------------------------------------------------------------
+# Frame relay: thread-safe bridge between sync render loop and async WebRTC
+# ---------------------------------------------------------------------------
 
-    def update(self, jpeg):
-        with self.lock:
-            self.frame = jpeg
-        self.event.set()
+class FrameRelay:
+    def __init__(self):
+        self._arr = None
+        self._cond = threading.Condition()
+
+    def push(self, rgb_array):
+        with self._cond:
+            self._arr = rgb_array
+            self._cond.notify_all()
+
+    def wait_and_get(self, timeout=2.0):
+        with self._cond:
+            self._cond.wait(timeout=timeout)
+            return self._arr
 
     def get(self):
-        with self.lock:
-            return self.frame
+        with self._cond:
+            return self._arr
 
-    def wait(self, t=2.0):
-        self.event.wait(t)
-        self.event.clear()
+    def snapshot_jpeg(self, quality=50):
+        arr = self.get()
+        if arr is None:
+            return None
+        img = Image.fromarray(arr)
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=quality)
+        return buf.getvalue()
 
+
+# ---------------------------------------------------------------------------
+# WebRTC video track fed by the FrameRelay
+# ---------------------------------------------------------------------------
+
+class CameraTrack(MediaStreamTrack):
+    kind = "video"
+
+    def __init__(self, relay):
+        super().__init__()
+        self._relay = relay
+
+    async def recv(self):
+        loop = asyncio.get_event_loop()
+        arr = await loop.run_in_executor(None, self._relay.wait_and_get, 2.0)
+        if arr is None:
+            frame = VideoFrame(width=1920, height=1080, format="rgb24")
+        else:
+            frame = VideoFrame.from_ndarray(arr, format="rgb24")
+        pts, time_base = await self.next_timestamp()
+        frame.pts = pts
+        frame.time_base = time_base
+        return frame
+
+
+# ---------------------------------------------------------------------------
+# SDP helper — reorder payload types so H.264 comes first
+# ---------------------------------------------------------------------------
+
+def _prefer_h264(sdp):
+    lines = sdp.split("\r\n")
+    h264_pts = set()
+    for line in lines:
+        if line.startswith("a=rtpmap:") and "H264" in line:
+            h264_pts.add(line.split(":")[1].split(" ")[0])
+    if not h264_pts:
+        return sdp
+    result = []
+    for line in lines:
+        if line.startswith("m=video "):
+            parts = line.split(" ")
+            header, pts = parts[:3], parts[3:]
+            line = " ".join(
+                header
+                + [p for p in pts if p in h264_pts]
+                + [p for p in pts if p not in h264_pts]
+            )
+        result.append(line)
+    return "\r\n".join(result)
+
+
+# ---------------------------------------------------------------------------
+# Active peer connections
+# ---------------------------------------------------------------------------
+
+_pcs = set()
+
+
+# ---------------------------------------------------------------------------
+# Inline HTML page — WebRTC viewer with telemetry HUD
+# ---------------------------------------------------------------------------
 
 _OVERLAY_HTML = """<!DOCTYPE html><html><head>
 <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
 <title>openpilot live</title>
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#000000">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icon-192.png">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#000;overflow:hidden;height:100vh;width:100vw;margin:0;font-family:-apple-system,sans-serif}
@@ -47,9 +127,6 @@ body{background:#000;overflow:hidden;height:100vh;width:100vw;margin:0;font-fami
 
 /* Overlay container - matches image bounds */
 #hud{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none}
-
-/* Speed cluster - center bottom */
-
 
 /* Set speed - top right */
 #set-speed{position:absolute;top:18%;left:1%;background:rgba(0,0,0,0.5);border-radius:12px;padding:6px 14px;text-align:center;border:1px solid rgba(255,255,255,0.15)}
@@ -97,7 +174,7 @@ body{background:#000;overflow:hidden;height:100vh;width:100vw;margin:0;font-fami
 
 </style></head><body>
 <div id="wrap">
-  <img id="cam" src="/stream">
+  <video id="cam" autoplay playsinline muted></video>
   <div id="hud"><div ontouchend="event.preventDefault();event.stopPropagation();toggleFS();" onclick="toggleFS()" style="position:absolute;right:1%;top:5%;background:rgba(0,0,0,0.4);border:1px solid rgba(255,255,255,0.2);color:rgba(255,255,255,0.6);font-size:16px;padding:8px 12px;border-radius:8px;pointer-events:auto;z-index:9999;cursor:pointer">&#x26F6;</div>
     <div id="status"><span id="engage-badge" class="off">OFF</span></div>
 
@@ -111,10 +188,6 @@ body{background:#000;overflow:hidden;height:100vh;width:100vw;margin:0;font-fami
       <div id="lead-gap">--</div>
     </div>
 
-
-
-    
-    
     <div id="m-accel">
       <div id="accel-label">ACCEL</div>
       <div id="accel-bar-wrap">
@@ -140,12 +213,51 @@ body{background:#000;overflow:hidden;height:100vh;width:100vw;margin:0;font-fami
   </div>
 </div>
 <script>
+/* ---------- WebRTC ---------- */
+let pc = null, retryMs = 1000;
+async function startWebRTC() {
+  if (pc) { try { pc.close(); } catch(e) {} pc = null; }
+  pc = new RTCPeerConnection({ iceServers: [] });
+  var tr = pc.addTransceiver('video', { direction: 'recvonly' });
+  try {
+    var caps = RTCRtpReceiver.getCapabilities('video');
+    if (caps && tr.setCodecPreferences) {
+      var h264 = caps.codecs.filter(function(c){ return c.mimeType==='video/H264'; });
+      var rest = caps.codecs.filter(function(c){ return c.mimeType!=='video/H264'; });
+      if (h264.length) tr.setCodecPreferences(h264.concat(rest));
+    }
+  } catch(e) {}
+  pc.ontrack = function(ev) {
+    document.getElementById('cam').srcObject = ev.streams[0];
+    retryMs = 1000;
+  };
+  pc.oniceconnectionstatechange = function() {
+    if (pc.iceConnectionState==='failed' || pc.iceConnectionState==='disconnected') {
+      setTimeout(startWebRTC, retryMs);
+      retryMs = Math.min(retryMs * 2, 10000);
+    }
+  };
+  try {
+    var offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    var r = await fetch('/offer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sdp: offer.sdp, type: offer.type })
+    });
+    var answer = await r.json();
+    await pc.setRemoteDescription(new RTCSessionDescription(answer));
+  } catch(e) {
+    setTimeout(startWebRTC, retryMs);
+    retryMs = Math.min(retryMs * 2, 10000);
+  }
+}
+
+/* ---------- Telemetry polling ---------- */
 let lastData = null;
 function poll() {
   fetch('/telemetry').then(r => r.json()).then(d => {
     lastData = d;
-    // Speed
-
 
     // Set speed
     const sv = document.getElementById('set-val');
@@ -164,20 +276,12 @@ function poll() {
     if (isEngaged && d.leadDist !== undefined && d.leadDist !== null) {
       li.className = 'show';
       const ft = Math.round(d.leadDist * 3.28084);
-      const egoMph = d.vEgo * 2.23694;
       const gap = d.vEgo > 0.5 ? (d.leadDist / d.vEgo).toFixed(1) : '--';
       document.getElementById('lead-dist').textContent = ft + ' ft';
       document.getElementById('lead-gap').textContent = gap + ' s';
     } else {
       li.className = '';
     }
-
-    // Steer
-    
-
-    // Grade
-    
-    
 
     // Accel
     const a = d.aEgo || 0;
@@ -203,96 +307,203 @@ function poll() {
   }).catch(() => {});
   setTimeout(poll, 250);
 }
+
 document.addEventListener("DOMContentLoaded",function(){
+  startWebRTC();
   setTimeout(function(){window.scrollTo(0,1);},100);
   setTimeout(function(){window.scrollTo(0,0);},200);
+  poll();
+  if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js').catch(function(){});}
 });
 function toggleFS(){var d=document.documentElement;try{if(!document.fullscreenElement&&!document.webkitFullscreenElement){if(d.requestFullscreen)d.requestFullscreen();else if(d.webkitRequestFullscreen)d.webkitRequestFullscreen(Element.ALLOW_KEYBOARD_INPUT);else if(d.webkitEnterFullscreen)d.webkitEnterFullscreen();else alert('Fullscreen not supported');}else{if(document.exitFullscreen)document.exitFullscreen();else if(document.webkitExitFullscreen)document.webkitExitFullscreen();}}catch(e){alert('FS error: '+e);}}
-poll();
 </script></body></html>"""
 
 
-class StreamHandler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
+# ---------------------------------------------------------------------------
+# aiohttp handlers
+# ---------------------------------------------------------------------------
 
-    def do_GET(self):
-        if self.path == "/stream":
-            self.send_response(200)
-            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=--frame")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            try:
-                while True:
-                    self.server._state.wait(2.0)
-                    f = self.server._state.get()
-                    if f:
-                        self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(f)).encode() + b"\r\n\r\n")
-                        self.wfile.write(f)
-                        self.wfile.write(b"\r\n")
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-        elif self.path == "/snapshot":
-            f = self.server._state.get()
-            if f:
-                self.send_response(200)
-                self.send_header("Content-Type", "image/jpeg")
-                self.send_header("Content-Length", str(len(f)))
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
-                self.wfile.write(f)
-            else:
-                self.send_response(503)
-                self.end_headers()
-        elif self.path == "/telemetry":
-            try:
-                with open("/tmp/telemetry.json", "r") as f:
-                    data = f.read().encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(data)))
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
-                self.wfile.write(data)
-            except:
-                self.send_response(503)
-                self.send_header("Content-Length", "0")
-                self.send_header("Connection", "close")
-                self.end_headers()
-        elif self.path == "/":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html")
-            self.send_header("Content-Length", str(len(_OVERLAY_HTML)))
-            self.end_headers()
-            self.wfile.write(_OVERLAY_HTML.encode())
-        else:
-            self.send_response(404)
-            self.end_headers()
-
-    def log_message(self, *a):
-        pass
+async def _handle_index(request):
+    return web.Response(text=_OVERLAY_HTML, content_type="text/html")
 
 
-_state = None
+async def _handle_offer(request):
+    try:
+        params = await request.json()
+    except Exception:
+        return web.Response(status=400, text="Invalid JSON")
+    if "sdp" not in params or "type" not in params:
+        return web.Response(status=400, text="Missing sdp or type")
+
+    pc = RTCPeerConnection()
+    _pcs.add(pc)
+
+    @pc.on("connectionstatechange")
+    async def _on_state():
+        if pc.connectionState in ("failed", "closed"):
+            await pc.close()
+            _pcs.discard(pc)
+
+    relay = request.app["relay"]
+    pc.addTrack(CameraTrack(relay))
+
+    offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
+    await pc.setRemoteDescription(offer)
+
+    answer = await pc.createAnswer()
+    answer = RTCSessionDescription(sdp=_prefer_h264(answer.sdp), type=answer.type)
+    await pc.setLocalDescription(answer)
+
+    return web.json_response(
+        {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
+    )
+
+
+async def _handle_telemetry(request):
+    try:
+        with open("/tmp/telemetry.json", "r") as fh:
+            data = fh.read()
+        return web.Response(
+            text=data,
+            content_type="application/json",
+            headers={"Cache-Control": "no-cache", "Access-Control-Allow-Origin": "*"},
+        )
+    except Exception:
+        return web.Response(status=503)
+
+
+# ---------------------------------------------------------------------------
+# PWA assets — manifest, service worker, icons
+# ---------------------------------------------------------------------------
+
+_MANIFEST = json.dumps({
+    "name": "openpilot live",
+    "short_name": "OP Live",
+    "start_url": "/",
+    "display": "standalone",
+    "orientation": "landscape",
+    "background_color": "#000000",
+    "theme_color": "#000000",
+    "icons": [
+        {"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml"},
+        {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"},
+        {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any"}
+    ]
+})
+
+_SW_JS = """self.addEventListener('install',function(e){self.skipWaiting();});
+self.addEventListener('activate',function(e){e.waitUntil(clients.claim());});
+self.addEventListener('fetch',function(e){e.respondWith(fetch(e.request));});
+"""
+
+_ICON_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><rect width="512" height="512" rx="80" fill="#000"/><circle cx="256" cy="220" r="90" fill="none" stroke="#4caf50" stroke-width="18"/><path d="M160 340 Q256 420 352 340" fill="none" stroke="#4fc3f7" stroke-width="14" stroke-linecap="round"/><rect x="220" y="380" width="72" height="24" rx="6" fill="#fff" opacity=".8"/></svg>'
+
+
+def _generate_icon_png(size):
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 255))
+    # Draw a simple green circle in the center
+    cx, cy, r = size // 2, size * 43 // 100, size * 18 // 100
+    for y in range(size):
+        for x in range(size):
+            dx, dy = x - cx, y - cy
+            d = (dx * dx + dy * dy) ** 0.5
+            if abs(d - r) < size * 2 // 100:
+                img.putpixel((x, y), (76, 175, 80, 255))
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue()
+
+
+_icon_cache = {}
+
+
+async def _handle_manifest(request):
+    return web.Response(text=_MANIFEST, content_type="application/manifest+json")
+
+
+async def _handle_sw(request):
+    return web.Response(text=_SW_JS, content_type="application/javascript")
+
+
+async def _handle_icon_svg(request):
+    return web.Response(text=_ICON_SVG, content_type="image/svg+xml")
+
+
+async def _handle_icon_png(request):
+    size_str = request.match_info.get("size", "192")
+    size = int(size_str)
+    if size not in (192, 512):
+        return web.Response(status=404)
+    if size not in _icon_cache:
+        loop = asyncio.get_event_loop()
+        _icon_cache[size] = await loop.run_in_executor(None, _generate_icon_png, size)
+    return web.Response(body=_icon_cache[size], content_type="image/png")
+
+
+async def _handle_snapshot(request):
+    relay = request.app["relay"]
+    quality = int(request.query.get("q", "50"))
+    jpeg = relay.snapshot_jpeg(quality)
+    if jpeg:
+        return web.Response(
+            body=jpeg,
+            content_type="image/jpeg",
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
+    return web.Response(status=503)
+
+
+async def _on_shutdown(app):
+    coros = [pc.close() for pc in _pcs]
+    await asyncio.gather(*coros)
+    _pcs.clear()
+
+
+# ---------------------------------------------------------------------------
+# Background server (runs in its own thread with a new event loop)
+# ---------------------------------------------------------------------------
+
+def _run_server(relay, port):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    app = web.Application()
+    app["relay"] = relay
+    app.router.add_get("/", _handle_index)
+    app.router.add_post("/offer", _handle_offer)
+    app.router.add_get("/telemetry", _handle_telemetry)
+    app.router.add_get("/snapshot", _handle_snapshot)
+    app.router.add_get("/manifest.json", _handle_manifest)
+    app.router.add_get("/sw.js", _handle_sw)
+    app.router.add_get("/icon.svg", _handle_icon_svg)
+    app.router.add_get("/icon-{size}.png", _handle_icon_png)
+    app.on_shutdown.append(_on_shutdown)
+    runner = web.AppRunner(app)
+    loop.run_until_complete(runner.setup())
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    loop.run_until_complete(site.start())
+    loop.run_forever()
+
+
+# ---------------------------------------------------------------------------
+# Public API (called from openpilot render loop)
+# ---------------------------------------------------------------------------
+
+_relay = None
 _counter = 0
 
 
 def start(port=8082):
-    """Start the MJPEG HTTP server in a background thread."""
-    global _state
-    _state = StreamState()
-    srv = ThreadingHTTPServer(("0.0.0.0", port), StreamHandler)
-    srv._state = _state
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    """Start the WebRTC signaling server in a background thread."""
+    global _relay
+    _relay = FrameRelay()
+    t = threading.Thread(target=_run_server, args=(_relay, port), daemon=True)
     t.start()
-    return _state
 
 
 def capture_frame(app, quality=50, target_fps=10):
-    """Call this from the render loop to capture a frame."""
+    """Capture a frame from the render texture for WebRTC streaming."""
     global _counter
-    if _state is None or app._render_texture is None:
+    if _relay is None or app._render_texture is None:
         return
     _counter += 1
     skip = max(1, app._target_fps // target_fps)
@@ -300,8 +511,8 @@ def capture_frame(app, quality=50, target_fps=10):
         return
     si = rl.load_image_from_texture(app._render_texture.texture)
     raw = bytes(rl.ffi.buffer(si.data, si.width * si.height * 4))
+    w, h = si.width, si.height
     rl.unload_image(si)
-    img = Image.frombytes("RGBA", (si.width, si.height), raw).transpose(Image.FLIP_TOP_BOTTOM).convert("RGB")
-    buf = io.BytesIO()
-    img.save(buf, "JPEG", quality=quality)
-    _state.update(buf.getvalue())
+    arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 4))
+    arr = arr[::-1, :, :3].copy()
+    _relay.push(arr)

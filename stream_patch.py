@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Patch application.py for Comma4-UI-Streamer (STREAM=1 support).
+"""Patch application.py for Comma4-UI-Streamer WebRTC (STREAM=1 support).
 Idempotent — safe to run multiple times.
 
 Usage: python3 /data/stream_patch.py
@@ -74,7 +74,7 @@ stream_init = '''
                   rl.set_texture_filter(self._render_texture.texture, rl.TextureFilter.TEXTURE_FILTER_BILINEAR)
               port = int(os.getenv("STREAM_PORT", "8082"))
               ui_stream.start(port)
-              cloudlog.warning(f"MJPEG stream on port {port}")
+              cloudlog.warning(f"WebRTC stream on port {port}")
           except Exception as e:
               cloudlog.error(f"Stream init failed: {e}")
               self._ui_stream = None'''
