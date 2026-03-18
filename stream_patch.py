@@ -63,7 +63,7 @@ else:
 #   - try/except with cloudlog error handling
 # ---------------------------------------------------------------------------
 stream_init = '''
-      if os.getenv("STREAM") == "1":
+      if os.path.exists("/data/ui_stream.py"):
           try:
               import sys as _sys
               _sys.path.insert(0, "/data")
