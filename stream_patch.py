@@ -10,8 +10,8 @@ import re
 from pathlib import Path
 
 PATHS = [
-    Path("/data/openpilot/system/ui/lib/application.py"),
     Path("/data/openpilot/openpilot/system/ui/lib/application.py"),
+    Path("/data/openpilot/system/ui/lib/application.py"),
 ]
 
 target = None
