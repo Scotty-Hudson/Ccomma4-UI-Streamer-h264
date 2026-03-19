@@ -24,8 +24,10 @@ else:
 
     # -----------------------------------------------------------------
     # Frame capture helper (called every render frame, throttled)
+    # Uses the same approach as sunnypilot's RECORD mode:
+    # rl.load_image_from_texture(render_texture.texture)
+    # This avoids the Adreno GPU stride bug with glReadPixels.
     # -----------------------------------------------------------------
-    _SNAP_PATH = b"/tmp/_stream_cap.png"
     _capture_logged = False
 
     def _do_capture_frame(app):
@@ -39,11 +41,13 @@ else:
         try:
             import numpy as np
             import pyray as rl
-            from PIL import Image as PILImage
             from ui_frame_bridge import publish_frame
 
-            # Capture the screen via raylib
-            image = rl.load_image_from_screen()
+            rt = getattr(app, "_render_texture", None)
+            if rt is None:
+                return  # No render texture — nothing to capture
+
+            image = rl.load_image_from_texture(rt.texture)
             w, h = image.width, image.height
             if w <= 0 or h <= 0:
                 rl.unload_image(image)
@@ -52,21 +56,19 @@ else:
             if not _capture_logged:
                 import logging
                 logging.getLogger("stream_hook").info(
-                    "first capture: %dx%d fmt=%d render=%dx%d",
-                    w, h, image.format,
-                    rl.get_render_width(), rl.get_render_height(),
+                    "first capture: %dx%d fmt=%d", w, h, image.format,
                 )
                 _capture_logged = True
 
-            # Use raylib's own export to PNG (handles format/stride correctly)
-            # /tmp is tmpfs on comma — no flash wear
-            rl.export_image(image, _SNAP_PATH)
+            # Exact same approach as sunnypilot RECORD:
+            # image data is RGBA, w*h*4 bytes
+            data_size = w * h * 4
+            raw = bytes(rl.ffi.buffer(image.data, data_size))
             rl.unload_image(image)
 
-            # Decode with PIL (guaranteed correct)
-            img = PILImage.open(_SNAP_PATH).convert("RGB")
-            rgb = np.array(img)
-            publish_frame(rgb, img.width, img.height)
+            arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 4))
+            rgb = arr[:, :, :3].copy()  # drop alpha, no flip needed
+            publish_frame(rgb, w, h)
         except Exception as e:
             import logging
             logging.getLogger("stream_hook").warning("capture error: %s", e, exc_info=True)
@@ -107,6 +109,19 @@ else:
 
         def _init_window_with_stream(self, *args, **kwargs):
             _orig_init_window(self, *args, **kwargs)
+            # Create render texture if not already present (e.g. RECORD mode).
+            # The render() method already supports _render_texture — when it
+            # exists, it renders to the texture then draws it to screen.
+            # We capture frames from this texture (same as RECORD mode).
+            if getattr(self, "_render_texture", None) is None:
+                import pyray as rl
+                sw = getattr(self, "_scaled_width", None) or self.width
+                sh = getattr(self, "_scaled_height", None) or self.height
+                self._render_texture = rl.load_render_texture(int(sw), int(sh))
+                rl.set_texture_filter(
+                    self._render_texture.texture,
+                    rl.TextureFilter.TEXTURE_FILTER_BILINEAR,
+                )
             _start_stream()
 
         # Try wrapping _monitor_fps (per-frame). If it doesn't exist,
