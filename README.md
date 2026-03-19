@@ -2,6 +2,8 @@
 
 Stream your comma 4's live sunnypilot/openpilot UI to any browser on your local network via WebRTC (H.264 preferred).
 
+> Forked from [Comma4-UI-Streamer](https://github.com/peterclampton/Comma4-UI-Streamer) by [peterclampton](https://github.com/peterclampton). Original project provided MJPEG streaming of the comma UI. This fork replaces MJPEG with WebRTC (H.264 preferred), adds a real-time telemetry overlay via SSE, PWA support, and a zero-patch install architecture.
+
 ![comma 4](https://img.shields.io/badge/comma-4-blue) ![openpilot](https://img.shields.io/badge/openpilot-compatible-blue) ![sunnypilot](https://img.shields.io/badge/sunnypilot-compatible-green)
 
 ![Screenshot](screenshot.png)
@@ -11,17 +13,18 @@ Stream your comma 4's live sunnypilot/openpilot UI to any browser on your local 
 Open `http://<comma-ip>:8082` on your phone, infotainment screen, or any browser — and see the comma UI live with full HUD overlay (lane lines, lead car, speed, alerts) plus real-time telemetry data. Video is delivered via WebRTC with H.264 codec preference for low-latency, bandwidth-efficient streaming.
 
 **Live overlay includes:**
-- Set speed, engage status (Engaged / Standby / Steering with sunnypilot MADS)
+- Set speed, speed limit (from map data), engage status (Engaged / Standby / Steering with sunnypilot MADS)
 - Lead car distance (ft) and gap time (seconds) — appears when a lead car is detected and self-driving is active
 - Acceleration bar, gas/brake output
 - Road grade (%)
-- Performance monitoring — model exec time, frame drops, CPU temperature & memory usage
+- Performance monitoring — model exec time, frame drops, CPU temperature, CPU usage & memory usage
 
 **Endpoints:**
 - `/` — fullscreen viewer with telemetry overlay (WebRTC video)
 - `/offer` — WebRTC signaling (POST SDP offer, receive SDP answer)
+- `/telemetry/stream` — Server-Sent Events (SSE) telemetry stream
+- `/telemetry` — one-shot telemetry JSON (for debugging / curl)
 - `/snapshot` — grab a single JPEG frame
-- `/telemetry` — live telemetry JSON
 - `/health` — JSON status (frame availability, resolution, timestamp)
 
 ---
@@ -42,7 +45,7 @@ ssh comma@<your-comma-ip>
 
 ```bash
 # Download the installer
-curl -fsSL https://raw.githubusercontent.com/Scotty-Hudson/Ccomma4-UI-Streamer-h264/h264/ensure_stream.sh -o /data/ensure_stream.sh
+curl -fsSL https://raw.githubusercontent.com/Scotty-Hudson/Ccomma4-UI-Streamer-h264/main/ensure_stream.sh -o /data/ensure_stream.sh
 chmod +x /data/ensure_stream.sh
 
 # Run it (installs stream files + Python hook + boot service)
@@ -91,8 +94,10 @@ Works best on phones and tablets when added as a web app. This gives you a fulls
 **Android (Chrome):**
 1. Open `http://<comma-ip>:8082` in Chrome
 2. Tap the **⋮** menu (top right)
-3. Tap **Add to Home Screen** (or **Install app**)
+3. Tap **Add to Home Screen**
 4. Tap **Add**
+
+> **Note:** Chrome's "Install app" option requires HTTPS, which isn't available on a local network device. Use **Add to Home Screen** instead — it works the same way.
 
 The stream will now open as a standalone app — no browser bar, no tabs, just the live UI.
 
@@ -126,7 +131,7 @@ A `.pth` file in Python's site-packages directory loads `stream_hook.py` at Pyth
 2. **`_monitor_fps`** is wrapped to capture the render texture as an RGB frame each tick
 3. Frames are published to a shared buffer (`ui_frame_bridge.py`) consumed by the WebRTC video track
 
-When a browser connects, it negotiates a WebRTC peer connection via the `/offer` endpoint. Both the SDP answer and codec preferences are set to prefer H.264, giving you hardware-friendly, low-latency video with minimal bandwidth. The telemetry overlay reads live vehicle data from `/tmp/telemetry.json` and displays it on top of the video feed in the browser.
+When a browser connects, it negotiates a WebRTC peer connection via the `/offer` endpoint. Both the SDP answer and codec preferences are set to prefer H.264, giving you hardware-friendly, low-latency video with minimal bandwidth. The telemetry overlay receives live vehicle and system data via Server-Sent Events (SSE) — a persistent connection that pushes updates as they arrive, with no polling overhead.
 
 **No openpilot source files are modified.** Everything lives in `/data/` and the Python site-packages `.pth` file, both of which persist across git resets and overlay swaps.
 
@@ -181,6 +186,10 @@ sudo reboot
 - comma 4
 - sunnypilot staging + dev (March 2026)
 - 2017 Lexus RX350 (TSS-P)
+
+## Credits
+
+- **[peterclampton](https://github.com/peterclampton)** — original [Comma4-UI-Streamer](https://github.com/peterclampton/Comma4-UI-Streamer) project
 
 ## License
 

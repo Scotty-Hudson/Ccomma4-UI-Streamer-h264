@@ -4,7 +4,6 @@ Frames are published by stream_hook.py via ui_frame_bridge.  This module
 provides the WebRTC signaling server that feeds those frames to browsers.
 """
 import fractions
-import io
 import os
 import asyncio
 import json
@@ -40,24 +39,19 @@ class CameraTrack(MediaStreamTrack):
 
     async def recv(self):
         loop = asyncio.get_event_loop()
-        logger.debug("recv() called, count=%d", self._recv_count)
         while True:
             now = time.time()
             sleep_for = self._frame_interval - (now - self._last_sent)
             if sleep_for > 0:
                 await asyncio.sleep(sleep_for)
 
-            logger.debug("recv: calling wait_for_frame...")
             arr, w, h, ts = await loop.run_in_executor(None, wait_for_frame, 2.0)
-            logger.debug("recv: wait_for_frame returned arr=%s %dx%d ts=%s", arr is not None, w, h, ts)
             if arr is None or w <= 0 or h <= 0:
-                logger.warning("recv: no frame available (arr=%s, %dx%d)", arr is not None, w, h)
                 continue
             if ts == self._last_source_ts:
                 await asyncio.sleep(0.02)
                 arr, w, h, ts = await loop.run_in_executor(None, get_latest_frame)
                 if arr is None or ts == self._last_source_ts:
-                    logger.debug("recv: stale frame, skipping")
                     continue
 
             # Ensure dimensions are even (required by H.264 yuv420p)
@@ -119,7 +113,6 @@ _pcs = set()
 # ---------------------------------------------------------------------------
 _sse_clients: list[asyncio.Queue] = []  # one queue per connected SSE client
 _telemetry_latest: dict = {}            # latest snapshot, shared with SSE handler
-_telemetry_event = None                 # asyncio.Event, set from collector thread
 
 
 # ---------------------------------------------------------------------------
@@ -558,7 +551,7 @@ async def _on_shutdown(app):
 # Telemetry collector — reads cereal, pushes to SSE clients
 # ---------------------------------------------------------------------------
 
-def _telemetry_collector(loop):
+def _telemetry_collector():
     """Background thread: subscribe to cereal and push to SSE clients.
 
     System metrics (CPU temp/usage, memory) come from deviceState and are
@@ -694,7 +687,7 @@ def run_server(host="0.0.0.0", port=8082, fps=10):
     _fh = logging.FileHandler("/tmp/ui_stream.log")
     _fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     logging.root.addHandler(_fh)
-    logging.root.setLevel(logging.DEBUG)
+    logging.root.setLevel(logging.INFO)
     logger.info("Starting UI WebRTC server on %s:%s at %s fps", host, port, fps)
 
     loop = asyncio.new_event_loop()
@@ -718,7 +711,7 @@ def run_server(host="0.0.0.0", port=8082, fps=10):
 
     # Start telemetry collector (reads cereal → pushes to SSE clients)
     import threading
-    tc = threading.Thread(target=_telemetry_collector, args=(loop,), daemon=True, name="telemetry-collector")
+    tc = threading.Thread(target=_telemetry_collector, daemon=True, name="telemetry-collector")
     tc.start()
 
     loop.run_forever()

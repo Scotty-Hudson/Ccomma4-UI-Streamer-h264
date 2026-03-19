@@ -13,7 +13,7 @@
 
 set -e
 
-STREAM_REPO="https://raw.githubusercontent.com/Scotty-Hudson/Ccomma4-UI-Streamer-h264/h264"
+STREAM_REPO="https://raw.githubusercontent.com/Scotty-Hudson/Ccomma4-UI-Streamer-h264/main"
 
 # ---------- 1. Ensure stream files exist in /data/ ----------
 
