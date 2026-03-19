@@ -36,9 +36,10 @@ def get_latest_frame():
 
 
 def wait_for_frame(timeout=2.0):
-    """Block until a new frame arrives, then return it."""
+    """Block until a frame is available, then return it."""
     with _cond:
-        _cond.wait(timeout=timeout)
+        if _latest_frame is None:
+            _cond.wait(timeout=timeout)
         if _latest_frame is None:
             return None, 0, 0, 0.0
         return _latest_frame.copy(), _latest_width, _latest_height, _latest_ts

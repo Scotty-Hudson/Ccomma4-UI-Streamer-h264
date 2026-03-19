@@ -34,19 +34,22 @@ class CameraTrack(MediaStreamTrack):
         self._last_source_ts = 0.0
 
     async def recv(self):
+        loop = asyncio.get_event_loop()
         while True:
             now = time.time()
             sleep_for = self._frame_interval - (now - self._last_sent)
             if sleep_for > 0:
-                await asyncio.sleep(min(sleep_for, 0.01))
+                await asyncio.sleep(sleep_for)
 
-            loop = asyncio.get_event_loop()
             arr, w, h, ts = await loop.run_in_executor(None, wait_for_frame, 2.0)
             if arr is None or w <= 0 or h <= 0:
                 continue
             if ts == self._last_source_ts:
-                await asyncio.sleep(0.005)
-                continue
+                # Same frame — wait a bit for a new one
+                await asyncio.sleep(0.02)
+                arr, w, h, ts = await loop.run_in_executor(None, get_latest_frame)
+                if arr is None or ts == self._last_source_ts:
+                    continue
 
             frame = VideoFrame.from_ndarray(arr, format="rgb24")
             pts, time_base = await self.next_timestamp()
