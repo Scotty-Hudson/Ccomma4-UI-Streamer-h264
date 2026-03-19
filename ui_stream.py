@@ -4,6 +4,7 @@ Frames are published by stream_hook.py via ui_frame_bridge.  This module
 provides the WebRTC signaling server that feeds those frames to browsers.
 """
 import fractions
+import io
 import os
 import asyncio
 import json

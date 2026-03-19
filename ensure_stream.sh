@@ -13,17 +13,26 @@
 
 set -e
 
-STREAM_REPO="https://raw.githubusercontent.com/Scotty-Hudson/Ccomma4-UI-Streamer-h264/main"
+STREAM_BRANCH="${STREAM_BRANCH:-take_over_bug_fix}"
+STREAM_REPO="https://raw.githubusercontent.com/Scotty-Hudson/Ccomma4-UI-Streamer-h264/${STREAM_BRANCH}"
 
-# ---------- 1. Ensure stream files exist in /data/ ----------
+# ---------- 1. Download / update stream files in /data/ ----------
+# Always re-download to pick up fixes.  Atomic: write to .tmp then mv,
+# so existing file is preserved if curl fails (e.g. no internet).
 
 for f in ui_stream.py ui_frame_bridge.py stream_hook.py; do
-  if [ ! -f "/data/$f" ]; then
-    echo "[ensure_stream] Downloading $f..."
-    curl -fsSL "$STREAM_REPO/$f" -o "/data/$f"
-    echo "[ensure_stream] $f downloaded"
+  echo "[ensure_stream] Updating $f from $STREAM_BRANCH ..."
+  if curl -fsSL "$STREAM_REPO/$f" -o "/data/$f.tmp"; then
+    mv "/data/$f.tmp" "/data/$f"
+    echo "[ensure_stream] $f updated"
   else
-    echo "[ensure_stream] $f exists"
+    rm -f "/data/$f.tmp"
+    if [ -f "/data/$f" ]; then
+      echo "[ensure_stream] $f download failed — keeping existing copy"
+    else
+      echo "[ensure_stream] ERROR: $f missing and download failed"
+      exit 1
+    fi
   fi
 done
 
