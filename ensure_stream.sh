@@ -2,25 +2,42 @@
 # Ensures UI Streamer persists across all sunnypilot updates and reboots.
 # Lives in /data/ — never wiped by updates.
 #
-# How it works (zero application.py patching):
-#   1. Downloads stream files to /data/ if missing
-#   2. Installs a .pth file in Python site-packages that loads stream_hook.py
-#      at Python startup — this monkeypatches GuiApplication at import time
-#   3. Installs itself as a systemd service
+# How it works (on every boot):
+#   1. Injects STREAM=1 into launch_env.sh (env vars)
+#   2. Downloads stream files to /data/ if missing or outdated
+#   3. Patches application.py with stream hooks (if not already patched)
+#   4. Installs itself as a systemd service (runs before openpilot)
 #
-# The .pth file and /data/ files are OUTSIDE the openpilot git repo,
-# so they survive git resets, overlay swaps, and sunnypilot updates.
+# The patch only runs inside the UI process (selfdrive.ui.ui).
+# Zero footprint in controlsd, paramsd, or any safety-critical process.
 
 set -e
 
 STREAM_BRANCH="${STREAM_BRANCH:-take_over_bug_fix}"
 STREAM_REPO="https://raw.githubusercontent.com/Scotty-Hudson/Ccomma4-UI-Streamer-h264/${STREAM_BRANCH}"
 
-# ---------- 1. Download / update stream files in /data/ ----------
-# Always re-download to pick up fixes.  Atomic: write to .tmp then mv,
-# so existing file is preserved if curl fails (e.g. no internet).
+# ---------- 1. Patch launch_env.sh with STREAM env vars ----------
 
-for f in ui_stream.py ui_frame_bridge.py stream_hook.py stream_hook_impl.py; do
+patch_env() {
+  local f="$1"
+  [ -f "$f" ] || return
+  grep -q '^export STREAM=1' "$f" || echo 'export STREAM=1' >> "$f"
+  grep -q '^export STREAM_QUALITY=' "$f" || echo 'export STREAM_QUALITY=50' >> "$f"
+  grep -q '^export STREAM_FPS=' "$f" || echo 'export STREAM_FPS=10' >> "$f"
+}
+
+# Patch live copy
+patch_env /data/openpilot/launch_env.sh
+
+# Patch any staged update waiting to be swapped in
+patch_env /data/safe_staging/finalized/launch_env.sh
+
+echo "[ensure_stream] env vars OK"
+
+# ---------- 2. Download / update stream files in /data/ ----------
+# Always re-download to pick up fixes.  Atomic: write to .tmp then mv.
+
+for f in ui_stream.py ui_frame_bridge.py stream_patch.py; do
   echo "[ensure_stream] Updating $f from $STREAM_BRANCH ..."
   if curl -fsSL "$STREAM_REPO/$f" -o "/data/$f.tmp"; then
     mv "/data/$f.tmp" "/data/$f"
@@ -38,46 +55,27 @@ done
 
 echo "[ensure_stream] stream files OK"
 
-# ---------- 2. Install .pth file in Python site-packages ----------
+# ---------- 3. Remove old .pth hook (if present) ----------
+# The .pth approach caused "Take Over Immediately" by running code in
+# safety-critical processes.  Clean it up completely.
 
-# Find Python 3 site-packages directory
-SITE_DIR=$(python3 -c "import site; print(site.getsitepackages()[0])" 2>/dev/null)
-
-if [ -z "$SITE_DIR" ]; then
-  echo "[ensure_stream] ERROR: could not find Python site-packages"
-  exit 1
-fi
-
-PTH_FILE="$SITE_DIR/comma_stream.pth"
-
-# .pth contents: add /data to path, then import the hook module
-PTH_CONTENT="/data
-import stream_hook"
-
-if [ ! -f "$PTH_FILE" ] || [ "$(cat "$PTH_FILE" 2>/dev/null)" != "$PTH_CONTENT" ]; then
-  echo "[ensure_stream] Installing .pth file to $PTH_FILE..."
+SITE_DIR=$(python3 -c "import site; print(site.getsitepackages()[0])" 2>/dev/null || true)
+if [ -n "$SITE_DIR" ] && [ -f "$SITE_DIR/comma_stream.pth" ]; then
+  echo "[ensure_stream] Removing old .pth hook..."
   mount -o remount,rw / 2>/dev/null || true
-  echo "$PTH_CONTENT" > "$PTH_FILE"
-  echo "[ensure_stream] .pth file installed"
-else
-  echo "[ensure_stream] .pth file exists"
+  rm -f "$SITE_DIR/comma_stream.pth"
+  echo "[ensure_stream] .pth hook removed"
 fi
 
-echo "[ensure_stream] Python hook OK"
+# Clean up old hook files (no longer needed)
+rm -f /data/stream_hook.py /data/stream_hook_impl.py
 
-# ---------- 3. Restore application.py if previously patched ----------
+# ---------- 4. Patch application.py (idempotent) ----------
 
-# Clean up old patches from application.py (from the old stream_patch.py approach)
-for app_py in /data/openpilot/system/ui/lib/application.py /data/openpilot/openpilot/system/ui/lib/application.py; do
-  bak="${app_py}.bak"
-  if [ -f "$bak" ]; then
-    echo "[ensure_stream] Restoring $app_py from backup (removing old patches)..."
-    cp "$bak" "$app_py"
-    rm -f "$bak"
-  fi
-done
+echo "[ensure_stream] Checking application.py patch..."
+python3 /data/stream_patch.py
 
-# ---------- 4. Install systemd service (if missing) ----------
+# ---------- 5. Install systemd service (if missing) ----------
 
 SERVICE=/etc/systemd/system/ensure-stream.service
 if [ ! -f "$SERVICE" ]; then

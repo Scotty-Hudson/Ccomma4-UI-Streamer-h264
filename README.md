@@ -2,7 +2,7 @@
 
 Stream your comma 4's live sunnypilot/openpilot UI to any browser on your local network via WebRTC (H.264 preferred).
 
-> Forked from [Comma4-UI-Streamer](https://github.com/peterclampton/Comma4-UI-Streamer) by [peterclampton](https://github.com/peterclampton). Original project provided MJPEG streaming of the comma UI. This fork replaces MJPEG with WebRTC (H.264 preferred), adds a real-time telemetry overlay via SSE, PWA support, and a zero-patch install architecture.
+> Forked from [Comma4-UI-Streamer](https://github.com/peterclampton/Comma4-UI-Streamer) by [peterclampton](https://github.com/peterclampton). Original project provided MJPEG streaming of the comma UI. This fork replaces MJPEG with WebRTC (H.264 preferred), adds a real-time telemetry overlay via SSE, cereal-based telemetry, and PWA support.
 
 ![comma 4](https://img.shields.io/badge/comma-4-blue) ![openpilot](https://img.shields.io/badge/openpilot-compatible-blue) ![sunnypilot](https://img.shields.io/badge/sunnypilot-compatible-green)
 
@@ -48,7 +48,7 @@ ssh comma@<your-comma-ip>
 curl -fsSL https://raw.githubusercontent.com/Scotty-Hudson/Ccomma4-UI-Streamer-h264/main/ensure_stream.sh -o /data/ensure_stream.sh
 chmod +x /data/ensure_stream.sh
 
-# Run it (installs stream files + Python hook + boot service)
+# Run it (patches application.py, sets env vars, installs boot service)
 sudo /data/ensure_stream.sh
 
 # Reboot to activate
@@ -65,15 +65,16 @@ http://<comma-ip>:8082
 
 `ensure_stream.sh` handles everything in one shot:
 
-1. **Stream files** — downloads `ui_stream.py`, `ui_frame_bridge.py`, and `stream_hook.py` to `/data/`
-2. **Python hook** — installs a `.pth` file in Python's site-packages that loads the stream hook at startup
-3. **Boot service** — installs a systemd service that re-runs on every boot, **before** openpilot starts
+1. **Env vars** — adds `STREAM=1` to `launch_env.sh`
+2. **Stream files** — downloads `ui_stream.py`, `ui_frame_bridge.py`, and `stream_patch.py` to `/data/`
+3. **Code patch** — patches `application.py` with stream hooks (creates a `.bak` backup first)
+4. **Boot service** — installs a systemd service that re-runs on every boot, **before** openpilot starts
 
-**No openpilot files are modified.** The hook monkeypatches `GuiApplication` at import time, so the stream survives git resets, overlay swaps, and sunnypilot updates automatically.
+The patch only injects code into the UI process (`selfdrive.ui.ui`). **Zero code runs in controlsd, paramsd, or any other safety-critical process.** When a sunnypilot update replaces `application.py` with stock code, the next reboot re-applies the patch automatically.
 
 ### After an AGNOS update
 
-AGNOS updates (rare — a few times a year) may wipe the `.pth` file and systemd service. Just re-run:
+AGNOS updates (rare — a few times a year) may wipe the systemd service. Just re-run:
 
 ```bash
 sudo /data/ensure_stream.sh
@@ -109,39 +110,44 @@ Set these environment variables before openpilot starts (e.g., in `launch_env.sh
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `STREAM` | `1` | Enabled by default after install |
 | `STREAM_PORT` | `8082` | HTTP port for the stream server |
+| `STREAM_QUALITY` | `50` | JPEG quality for snapshot endpoint (1–95) |
 | `STREAM_FPS` | `10` | Target capture/stream frame rate |
 
-Example:
+Example with all options:
 
 ```bash
+export STREAM=1
 export STREAM_PORT=8082
+export STREAM_QUALITY=50
 export STREAM_FPS=10
 ```
-
-The stream activates automatically when `/data/ui_stream.py` exists — no `STREAM=1` env var needed.
 
 ---
 
 ## How it works
 
-A `.pth` file in Python's site-packages directory loads `stream_hook.py` at Python startup. When the UI process imports `openpilot.system.ui.lib.application`, the hook intercepts the import via `sys.meta_path` and monkeypatches `GuiApplication`:
+The installer patches `application.py` to:
 
-1. **`init_window`** is wrapped to start the WebRTC server after the window initializes
-2. **`_monitor_fps`** is wrapped to capture the render texture as an RGB frame each tick
-3. Frames are published to a shared buffer (`ui_frame_bridge.py`) consumed by the WebRTC video track
+1. **Import** `/data/ui_stream.py` when `STREAM=1` is set
+2. **Create** a render texture for frame capture (if one doesn't already exist)
+3. **Capture** each rendered frame and publish it to a shared buffer (`ui_frame_bridge.py`)
 
-When a browser connects, it negotiates a WebRTC peer connection via the `/offer` endpoint. Both the SDP answer and codec preferences are set to prefer H.264, giving you hardware-friendly, low-latency video with minimal bandwidth. The telemetry overlay receives live vehicle and system data via Server-Sent Events (SSE) — a persistent connection that pushes updates as they arrive, with no polling overhead.
+GPU readback happens on the UI thread (~0.5ms), while heavy numpy work (reshape, flip, strip alpha) is offloaded to a background thread so the UI watchdog heartbeat is never delayed.
 
-**No openpilot source files are modified.** Everything lives in `/data/` and the Python site-packages `.pth` file, both of which persist across git resets and overlay swaps.
+When a browser connects, it negotiates a WebRTC peer connection via the `/offer` endpoint. Both the SDP answer and codec preferences are set to prefer H.264, giving you low-latency video with minimal bandwidth. The telemetry overlay receives live vehicle and system data via Server-Sent Events (SSE) — a persistent connection that pushes cereal messages as they arrive, with no polling overhead.
+
+The patch **only runs inside the UI process** (`selfdrive.ui.ui`). Zero code touches controlsd, paramsd, or any other safety-critical process.
 
 ---
 
 ## Troubleshooting
 
 **Connection refused on :8082**
-- Check the stream files exist: `ls -la /data/ui_stream.py /data/ui_frame_bridge.py /data/stream_hook.py`
-- Check the .pth file exists: `ls -la $(python3 -c "import site; print(site.getsitepackages()[0])")/comma_stream.pth`
+- SSH in and check: `grep ui_stream /data/openpilot/system/ui/lib/application.py` (try also with `openpilot/openpilot/` in the path)
+- If empty, the patch didn't apply. Run: `python3 /data/stream_patch.py`
+- Check `STREAM=1` is in `launch_env.sh`: `grep STREAM /data/openpilot/launch_env.sh`
 - Check port is listening: `ss -tlnp | grep 8082`
 - Check health endpoint: `curl http://localhost:8082/health`
 
@@ -158,14 +164,17 @@ When a browser connects, it negotiates a WebRTC peer connection via the `/offer`
 
 ```bash
 # Remove the stream files
-rm -f /data/ui_stream.py /data/ui_frame_bridge.py /data/stream_hook.py /data/stream_patch.py /data/ensure_stream.sh
+rm -f /data/ui_stream.py /data/ui_frame_bridge.py /data/stream_patch.py /data/ensure_stream.sh
 
-# Remove the .pth file
-SITE=$(python3 -c "import site; print(site.getsitepackages()[0])")
-sudo mount -o remount,rw /
-sudo rm -f "$SITE/comma_stream.pth"
+# Restore original application.py
+APP=$(find /data/openpilot -name "application.py.bak" -path "*/ui/lib/*" 2>/dev/null | head -1)
+[ -n "$APP" ] && cp "$APP" "${APP%.bak}"
+
+# Remove STREAM vars from launch_env.sh
+sed -i '/^export STREAM/d' /data/openpilot/launch_env.sh
 
 # Remove the boot service
+sudo mount -o remount,rw /
 sudo systemctl disable ensure-stream.service
 sudo rm -f /etc/systemd/system/ensure-stream.service
 sudo systemctl daemon-reload

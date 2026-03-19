@@ -1,7 +1,12 @@
 """WebRTC stream server (H.264 preferred) for sunnypilot UI with telemetry overlay.
 
-Frames are published by stream_hook.py via ui_frame_bridge.  This module
-provides the WebRTC signaling server that feeds those frames to browsers.
+Frames are captured by calling capture_frame(app) from the patched render loop
+in application.py.  The WebRTC server runs in a background thread started by
+start().
+
+This module is ONLY imported inside the UI process (selfdrive.ui.ui) via the
+STREAM=1 env-var gate in the patched application.py.  It never runs in
+controlsd, paramsd, or any other safety-critical process.
 """
 import fractions
 import io
@@ -10,15 +15,118 @@ import asyncio
 import json
 import logging
 import time
+import threading
+import queue
 
 from aiohttp import web
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCRtpSender, MediaStreamTrack
 from av import VideoFrame
 from PIL import Image
 
-from ui_frame_bridge import wait_for_frame, get_latest_frame, snapshot_jpeg
+from ui_frame_bridge import wait_for_frame, get_latest_frame, snapshot_jpeg, publish_frame
 
 logger = logging.getLogger("ui_webrtc")
+
+
+# ---------------------------------------------------------------------------
+# Frame capture — called from the patched render loop in application.py
+# ---------------------------------------------------------------------------
+
+_capture_counter = 0
+_capture_thread = None
+_capture_queue = None
+_capture_logged = False
+
+
+def _capture_worker():
+    """Background thread that processes raw frame buffers."""
+    import numpy as np
+    log = logging.getLogger("ui_stream.capture")
+
+    while True:
+        try:
+            raw, w, h = _capture_queue.get()
+            arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 4))
+            rgb = arr[::-1, :, :3].copy()  # flip vertically, drop alpha
+            publish_frame(rgb, w, h)
+        except Exception as e:
+            log.warning("capture worker error: %s", e)
+
+
+def _ensure_capture_thread():
+    global _capture_thread, _capture_queue
+    if _capture_thread is not None:
+        return
+    _capture_queue = queue.Queue(maxsize=2)
+    _capture_thread = threading.Thread(
+        target=_capture_worker, daemon=True, name="stream-capture"
+    )
+    _capture_thread.start()
+
+
+def capture_frame(app, quality=50, target_fps=10):
+    """Call from the render loop to capture a frame.
+
+    GPU readback happens on the calling (UI) thread (fast ~0.5ms).
+    Heavy numpy work is offloaded to a background thread so we never
+    delay the UI watchdog heartbeat.
+    """
+    global _capture_counter, _capture_logged
+    import pyray as rl
+
+    if app._render_texture is None:
+        return
+
+    _capture_counter += 1
+    skip = max(1, getattr(app, '_target_fps', 30) // target_fps)
+    if _capture_counter % skip != 0:
+        return
+
+    try:
+        image = rl.load_image_from_texture(app._render_texture.texture)
+        w, h = image.width, image.height
+        if w <= 0 or h <= 0:
+            rl.unload_image(image)
+            return
+
+        if not _capture_logged:
+            logger.info("first capture: %dx%d fmt=%d", w, h, image.format)
+            _capture_logged = True
+
+        raw = bytes(rl.ffi.buffer(image.data, w * h * 4))
+        rl.unload_image(image)
+
+        _ensure_capture_thread()
+        try:
+            _capture_queue.put_nowait((raw, w, h))
+        except Exception:
+            pass  # drop frame if queue full — never block UI thread
+
+    except Exception as e:
+        logger.warning("capture error: %s", e, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Server start — called from the patched application.py init
+# ---------------------------------------------------------------------------
+
+_server_started = False
+
+
+def start(port=8082):
+    """Start the WebRTC server in a background thread.  Safe to call multiple times."""
+    global _server_started
+    if _server_started:
+        return
+    fps = int(os.getenv("STREAM_FPS", "10"))
+    t = threading.Thread(
+        target=run_server,
+        kwargs={"port": port, "fps": fps},
+        daemon=True,
+        name="ui-webrtc",
+    )
+    t.start()
+    _server_started = True
 
 
 # ---------------------------------------------------------------------------
@@ -677,7 +785,7 @@ def _telemetry_collector():
 
 
 # ---------------------------------------------------------------------------
-# Server entry point (called from stream_hook.py in a background thread)
+# Server entry point (called via start() from patched application.py)
 # ---------------------------------------------------------------------------
 
 def run_server(host="0.0.0.0", port=8082, fps=10):
