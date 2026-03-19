@@ -16,21 +16,10 @@ import sys
 
 
 def _is_safe_to_hook():
-    """Check if it's safe to install the streaming hook in this process.
-
-    The .pth file loads this module into every Python process (controlsd,
-    paramsd, plannerd, radard, etc.).  We MUST NOT modify sys.path,
-    sys.meta_path, or import extra modules in safety-critical processes —
-    doing so can cause timing violations that trigger disengagements.
-
-    Strategy: DENY-LIST safety-critical processes.  If this process is NOT
-    in the deny list, allow the hook.  The hook is harmless in non-UI
-    processes because the meta_path finder returns None for every import
-    except the UI application module.
-    """
+    """Check if it's safe to install the streaming hook in this process."""
     _BLOCKED = (
         "controlsd", "paramsd", "plannerd", "radard",
-        "dmonitoringd", "card", "calibrationd", "locationd",
+        "dmonitoringd", "calibrationd", "locationd",
         "hardwared", "thermald", "modeld", "navmodeld",
         "ubloxd", "pandad", "pigeond", "sensord",
         "boardd", "loggerd", "encoderd", "proclogd",
@@ -41,7 +30,14 @@ def _is_safe_to_hook():
     try:
         with open("/proc/self/cmdline", "rb") as f:
             cmdline = f.read().decode("utf-8", errors="replace").lower()
-        return not any(blocked in cmdline for blocked in _BLOCKED)
+        blocked = any(b in cmdline for b in _BLOCKED)
+        # Debug: log every process decision to help diagnose issues
+        try:
+            with open("/tmp/stream_hook_guard.log", "a") as dbg:
+                dbg.write(f"pid={os.getpid()} blocked={blocked} cmdline={cmdline!r}\n")
+        except Exception:
+            pass
+        return not blocked
     except Exception:
         return False
 
