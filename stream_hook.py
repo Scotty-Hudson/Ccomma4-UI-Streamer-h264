@@ -108,27 +108,45 @@ else:
         GuiApp._stream_hooked = True
 
     # -----------------------------------------------------------------
-    # sys.meta_path import hook
+    # sys.meta_path import hook  (Python 3.12+ uses find_spec only)
     # -----------------------------------------------------------------
-    class _StreamFinder:
-        """Intercepts import of the UI application module to inject streaming."""
+    import importlib
+    import importlib.abc
+    import importlib.util
 
-        def find_module(self, fullname, path=None):
-            if fullname == _TARGET_MODULE:
-                return self
+    class _PatchingLoader:
+        """Wraps the real loader to apply monkeypatch after module exec."""
+
+        def __init__(self, original_loader):
+            self._original = original_loader
+
+        def create_module(self, spec):
+            if hasattr(self._original, "create_module"):
+                return self._original.create_module(spec)
             return None
 
-        def load_module(self, fullname):
+        def exec_module(self, module):
+            self._original.exec_module(module)
+            _patch_gui_app(module)
+
+    class _StreamFinder(importlib.abc.MetaPathFinder):
+        """Intercepts import of the UI application module to inject streaming."""
+
+        def find_spec(self, fullname, path, target=None):
+            if fullname != _TARGET_MODULE:
+                return None
+
             # Remove ourselves FIRST to avoid recursion
             sys.meta_path[:] = [f for f in sys.meta_path if not isinstance(f, _StreamFinder)]
 
-            # Let Python do the real import
-            __import__(fullname)
-            module = sys.modules[fullname]
+            # Find the real module spec using the remaining finders
+            spec = importlib.util.find_spec(fullname)
+            if spec is None:
+                return None
 
-            # Monkeypatch
-            _patch_gui_app(module)
-            return module
+            # Wrap the loader so we can patch after exec
+            spec.loader = _PatchingLoader(spec.loader)
+            return spec
 
     # Install the hook
     sys.meta_path.insert(0, _StreamFinder())
