@@ -107,7 +107,8 @@ Set these environment variables before openpilot starts (e.g., in `launch_env.sh
 | `STREAM` | `1` | Enabled by default after install |
 | `STREAM_PORT` | `8082` | HTTP port for the stream server |
 | `STREAM_QUALITY` | `50` | JPEG quality for snapshot endpoint (1–95) |
-| `STREAM_FPS` | `10` | Target capture/stream frame rate |
+| `STREAM_FPS` | `5` | Target capture/stream frame rate |
+| `STREAM_SCALE` | `0.5` | Resolution scale factor (0.5 = half res, 1.0 = full) |
 
 Example with all options:
 
@@ -115,7 +116,8 @@ Example with all options:
 export STREAM=1
 export STREAM_PORT=8082
 export STREAM_QUALITY=50
-export STREAM_FPS=10
+export STREAM_FPS=5
+export STREAM_SCALE=0.5
 ```
 
 ---

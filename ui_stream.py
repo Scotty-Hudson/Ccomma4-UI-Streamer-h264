@@ -39,15 +39,41 @@ _capture_logged = False
 
 
 def _capture_worker():
-    """Background thread that processes raw frame buffers."""
+    """Background thread that processes raw frame buffers.
+
+    Runs at lowest OS priority (nice 19) so openpilot safety-critical
+    processes always get CPU time first.  Downscales to half resolution
+    before publishing — this cuts H.264 encoding time ~4x.
+    """
     import numpy as np
+    try:
+        os.nice(19)
+    except OSError:
+        pass
     log = logging.getLogger("ui_stream.capture")
+    scale = float(os.getenv("STREAM_SCALE", "0.5"))
 
     while True:
         try:
             raw, w, h = _capture_queue.get()
             arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 4))
-            rgb = arr[::-1, :, :3].copy()  # flip vertically, drop alpha
+            rgb = arr[::-1, :, :3]  # flip vertically, drop alpha (view, no copy)
+
+            # Downscale — nearest-neighbor via stride slicing (fast, no PIL needed)
+            if 0 < scale < 1:
+                step = max(1, int(round(1.0 / scale)))
+                rgb = rgb[::step, ::step, :]
+                h, w = rgb.shape[0], rgb.shape[1]
+
+            # Ensure even dimensions (required by H.264 yuv420p)
+            if h % 2 != 0:
+                rgb = rgb[:h - 1, :, :]
+                h -= 1
+            if w % 2 != 0:
+                rgb = rgb[:, :w - 1, :]
+                w -= 1
+
+            rgb = np.ascontiguousarray(rgb)
             publish_frame(rgb, w, h)
         except Exception as e:
             log.warning("capture worker error: %s", e)
@@ -124,7 +150,7 @@ def start(port=8082):
     global _server_started
     if _server_started:
         return
-    fps = int(os.getenv("STREAM_FPS", "10"))
+    fps = int(os.getenv("STREAM_FPS", "5"))
     t = threading.Thread(
         target=run_server,
         kwargs={"port": port, "fps": fps},
@@ -680,6 +706,11 @@ def _telemetry_collector():
         logger.warning("cereal not available — telemetry collector disabled")
         return
 
+    try:
+        os.nice(19)
+    except OSError:
+        pass
+
     topics = ['deviceState', 'carState', 'controlsState', 'modelV2', 'radarState',
               'liveMapDataSP', 'navInstruction']
     sm = None
@@ -804,6 +835,10 @@ def _telemetry_collector():
 
 def run_server(host="0.0.0.0", port=8082, fps=10):
     """Start the aiohttp/WebRTC server (blocking — run in a thread)."""
+    try:
+        os.nice(19)
+    except OSError:
+        pass
     os.environ["STREAM_FPS"] = str(fps)
 
     # Log to file since UI process stderr isn't easily accessible
@@ -811,7 +846,7 @@ def run_server(host="0.0.0.0", port=8082, fps=10):
     _fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     logging.root.addHandler(_fh)
     logging.root.setLevel(logging.INFO)
-    logger.info("Starting UI WebRTC server on %s:%s at %s fps", host, port, fps)
+    logger.info("Starting UI WebRTC server on %s:%s at %s fps (scale=%s)", host, port, fps, os.getenv("STREAM_SCALE", "0.5"))
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
