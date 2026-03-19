@@ -2,6 +2,8 @@
 
 Stream your comma 4's live sunnypilot/openpilot UI to any browser on your local network via WebRTC (H.264 preferred).
 
+THERE IS CURRENTLY A BUG THAT PUTS THE DEVICE IN "TAKE OVER IMMEDIATLEY". Don't brother testing until I have this fixed!!!
+
 > Forked from [Comma4-UI-Streamer](https://github.com/peterclampton/Comma4-UI-Streamer) by [peterclampton](https://github.com/peterclampton). Original project provided MJPEG streaming of the comma UI. This fork replaces MJPEG with WebRTC (H.264 preferred), adds a real-time telemetry overlay via SSE, PWA support, and a zero-patch install architecture.
 
 ![comma 4](https://img.shields.io/badge/comma-4-blue) ![openpilot](https://img.shields.io/badge/openpilot-compatible-blue) ![sunnypilot](https://img.shields.io/badge/sunnypilot-compatible-green)
