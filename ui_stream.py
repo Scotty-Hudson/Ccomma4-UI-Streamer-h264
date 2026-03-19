@@ -67,11 +67,17 @@ def _ensure_capture_thread():
 def capture_frame(app, quality=50, target_fps=10):
     """Call from the render loop to capture a frame.
 
-    GPU readback happens on the calling (UI) thread (fast ~0.5ms).
-    Heavy numpy work is offloaded to a background thread so we never
-    delay the UI watchdog heartbeat.
+    NO-OP when no WebRTC peers are connected — zero overhead when nobody
+    is watching.  When active, GPU readback (fast ~0.5ms) happens on the
+    calling (UI) thread; heavy numpy work is offloaded to a background
+    thread so we never delay the UI watchdog heartbeat.
     """
     global _capture_counter, _capture_logged
+
+    # Skip everything when nobody is watching — saves ~80MB/s memory bandwidth
+    if not _pcs:
+        return
+
     import pyray as rl
 
     if app._render_texture is None:
@@ -676,10 +682,18 @@ def _telemetry_collector():
 
     topics = ['deviceState', 'carState', 'controlsState', 'modelV2', 'radarState',
               'liveMapDataSP', 'navInstruction']
-    sm = messaging.SubMaster(topics)
-    logger.info("telemetry collector started, topics=%s", topics)
+    sm = None
 
     while True:
+        # Don't poll cereal when nobody is listening — saves CPU + ZMQ overhead
+        if not _sse_clients and not _pcs:
+            time.sleep(2)
+            continue
+
+        if sm is None:
+            sm = messaging.SubMaster(topics)
+            logger.info("telemetry SubMaster created, topics=%s", topics)
+
         sm.update(0)  # non-blocking poll
         data = {}
 
