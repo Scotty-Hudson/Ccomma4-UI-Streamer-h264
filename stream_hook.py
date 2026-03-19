@@ -27,12 +27,9 @@ else:
     # -----------------------------------------------------------------
     def _do_capture_frame(app):
         global _capture_counter
-        rt = getattr(app, "_render_texture", None)
-        if rt is None:
-            return
         _capture_counter += 1
         target_fps = int(os.getenv("STREAM_FPS", "10"))
-        ui_fps = getattr(app, "_target_fps", 30)
+        ui_fps = getattr(app, "target_fps", None) or getattr(app, "_target_fps", 30)
         skip = max(1, ui_fps // target_fps)
         if _capture_counter % skip != 0:
             return
@@ -41,15 +38,24 @@ else:
             import pyray as rl
             from ui_frame_bridge import publish_frame
 
-            image = rl.load_image_from_texture(rt.texture)
+            rt = getattr(app, "_render_texture", None)
+            if rt is not None:
+                image = rl.load_image_from_texture(rt.texture)
+            else:
+                # Fallback: capture the screen framebuffer directly
+                image = rl.load_image_from_screen()
             w, h = image.width, image.height
+            if w <= 0 or h <= 0:
+                rl.unload_image(image)
+                return
             raw = bytes(rl.ffi.buffer(image.data, w * h * 4))
             rl.unload_image(image)
             arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 4))
             rgb = arr[::-1, :, :3].copy()
             publish_frame(rgb, w, h)
-        except Exception:
-            pass
+        except Exception as e:
+            import logging
+            logging.getLogger("stream_hook").warning("capture error: %s", e, exc_info=True)
 
     # -----------------------------------------------------------------
     # Start the WebRTC server (once)
@@ -84,27 +90,30 @@ else:
             return
 
         _orig_init_window = GuiApp.init_window
-        _orig_monitor_fps = GuiApp._monitor_fps
 
         def _init_window_with_stream(self, *args, **kwargs):
             _orig_init_window(self, *args, **kwargs)
-            # Ensure render texture exists for frame capture
-            if self._render_texture is None:
-                import pyray as rl
-                self._render_texture = rl.load_render_texture(self._width, self._height)
-                rl.set_texture_filter(
-                    self._render_texture.texture,
-                    rl.TextureFilter.TEXTURE_FILTER_BILINEAR,
-                )
             _start_stream()
 
-        def _monitor_fps_with_capture(self):
-            if _stream_started:
-                _do_capture_frame(self)
-            _orig_monitor_fps(self)
+        # Try wrapping _monitor_fps (per-frame). If it doesn't exist,
+        # try wrapping 'render' or 'paint' as alternatives.
+        _frame_method = None
+        for name in ("_monitor_fps", "render", "paint"):
+            if hasattr(GuiApp, name):
+                _frame_method = name
+                break
+
+        if _frame_method:
+            _orig_frame = getattr(GuiApp, _frame_method)
+
+            def _frame_with_capture(self, *args, **kwargs):
+                if _stream_started:
+                    _do_capture_frame(self)
+                return _orig_frame(self, *args, **kwargs)
+
+            setattr(GuiApp, _frame_method, _frame_with_capture)
 
         GuiApp.init_window = _init_window_with_stream
-        GuiApp._monitor_fps = _monitor_fps_with_capture
         GuiApp._stream_hooked = True
 
     # -----------------------------------------------------------------

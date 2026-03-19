@@ -358,13 +358,20 @@ async def _handle_offer(request):
 
 
 async def _handle_telemetry(request):
+    _HEADERS = {"Cache-Control": "no-cache", "Access-Control-Allow-Origin": "*"}
     try:
         with open("/tmp/telemetry.json", "r") as fh:
             data = fh.read()
         return web.Response(
             text=data,
             content_type="application/json",
-            headers={"Cache-Control": "no-cache", "Access-Control-Allow-Origin": "*"},
+            headers=_HEADERS,
+        )
+    except FileNotFoundError:
+        return web.json_response(
+            {"setSpeed": 0, "cruiseEnabled": False, "driveState": "off",
+             "aEgo": 0, "vEgo": 0, "gas": 0, "brake": 0},
+            headers=_HEADERS,
         )
     except Exception:
         return web.Response(status=503)
