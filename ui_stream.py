@@ -32,6 +32,7 @@ class CameraTrack(MediaStreamTrack):
         self._frame_interval = 1.0 / max(fps, 1)
         self._last_sent = 0.0
         self._last_source_ts = 0.0
+        self._recv_count = 0
 
     async def recv(self):
         loop = asyncio.get_event_loop()
@@ -43,18 +44,31 @@ class CameraTrack(MediaStreamTrack):
 
             arr, w, h, ts = await loop.run_in_executor(None, wait_for_frame, 2.0)
             if arr is None or w <= 0 or h <= 0:
+                if self._recv_count == 0:
+                    logger.warning("recv: no frame available (arr=%s, %dx%d)", arr is not None, w, h)
                 continue
             if ts == self._last_source_ts:
-                # Same frame — wait a bit for a new one
                 await asyncio.sleep(0.02)
                 arr, w, h, ts = await loop.run_in_executor(None, get_latest_frame)
                 if arr is None or ts == self._last_source_ts:
                     continue
 
+            # Ensure dimensions are even (required by H.264 yuv420p)
+            if h % 2 != 0:
+                arr = arr[:h - 1, :, :]
+                h -= 1
+            if w % 2 != 0:
+                arr = arr[:, :w - 1, :]
+                w -= 1
+
             frame = VideoFrame.from_ndarray(arr, format="rgb24")
             pts, time_base = await self.next_timestamp()
             frame.pts = pts
             frame.time_base = time_base
+
+            self._recv_count += 1
+            if self._recv_count <= 3:
+                logger.info("recv: sending frame #%d %dx%d pts=%s", self._recv_count, w, h, pts)
 
             self._last_sent = time.time()
             self._last_source_ts = ts
@@ -336,15 +350,16 @@ async def _handle_offer(request):
     fps = int(os.getenv("STREAM_FPS", "10"))
     sender = pc.addTrack(CameraTrack(fps=fps))
 
-    # Prefer H.264 via codec preferences
+    # Prefer H.264 via codec preferences (but allow fallback to VP8)
     transceiver = next((t for t in pc.getTransceivers() if t.sender == sender), None)
     if transceiver is not None:
         try:
             capabilities = RTCRtpSender.getCapabilities("video")
             if capabilities is not None:
-                preferred = [c for c in capabilities.codecs if c.mimeType.lower() == "video/h264"]
-                if preferred:
-                    transceiver.setCodecPreferences(preferred)
+                h264 = [c for c in capabilities.codecs if c.mimeType.lower() == "video/h264"]
+                rest = [c for c in capabilities.codecs if c.mimeType.lower() != "video/h264"]
+                if h264:
+                    transceiver.setCodecPreferences(h264 + rest)
         except Exception:
             pass
 
@@ -354,6 +369,8 @@ async def _handle_offer(request):
     answer = await pc.createAnswer()
     answer = RTCSessionDescription(sdp=_prefer_h264(answer.sdp), type=answer.type)
     await pc.setLocalDescription(answer)
+
+    logger.info("offer handled: pc=%s ice=%s", pc.connectionState, pc.iceConnectionState)
 
     return web.json_response(
         {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
