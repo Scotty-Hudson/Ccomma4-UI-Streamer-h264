@@ -6,14 +6,56 @@ to start the WebRTC stream server and capture frames.
 
 NO files inside /data/openpilot/ are modified.  This survives git resets,
 overlay swaps, and sunnypilot updates.
+
+IMPORTANT: This module is imported by EVERY Python process via the .pth
+file.  We must exit immediately in non-UI processes to avoid interfering
+with safety-critical processes (controlsd, paramsd, plannerd, etc.).
 """
 import os
 import sys
 
-# Quick exit if stream files are not deployed
-if not os.path.exists("/data/ui_stream.py") or not os.path.exists("/data/ui_frame_bridge.py"):
-    pass  # module imported but does nothing
-else:
+
+def _is_ui_process():
+    """Check if the current process is the UI process.
+
+    The .pth file loads this module into every Python process (controlsd,
+    paramsd, plannerd, radard, etc.).  We MUST NOT modify sys.path,
+    sys.meta_path, or import extra modules in safety-critical processes —
+    doing so can cause timing violations that trigger disengagements.
+    """
+    try:
+        with open("/proc/self/cmdline", "rb") as f:
+            parts = f.read().split(b"\x00")
+        cmdline = b" ".join(parts).decode("utf-8", errors="replace").lower()
+        # UI process cmdline contains the UI module path
+        # e.g. "python3 -m selfdrive.ui.onroad"  or  "system.ui.main"
+        if "selfdrive.ui" in cmdline or "system.ui" in cmdline:
+            return True
+        # Safety-critical processes we must NEVER activate in
+        _BLOCKED = ("controlsd", "paramsd", "plannerd", "radard",
+                     "dmonitoringd", "card", "calibrationd", "locationd",
+                     "hardwared", "thermald", "modeld", "navmodeld",
+                     "ubloxd", "pandad", "pigeond", "sensord",
+                     "boardd", "loggerd", "encoderd", "proclogd",
+                     "logmessaged", "tombstoned", "updated", "uploader")
+        if any(p in cmdline for p in _BLOCKED):
+            return False
+        # Unknown process — check if it might import the UI module
+        # by looking for generic "ui" in arguments (but not in paths like /usr/lib)
+        for part in parts:
+            arg = part.decode("utf-8", errors="replace").lower()
+            if arg.endswith("/ui") or arg.endswith(".ui") or arg == "ui":
+                return True
+        return False
+    except Exception:
+        return False
+
+
+# Quick exit: only proceed if stream files are deployed AND we're the UI process
+if (os.path.exists("/data/ui_stream.py")
+        and os.path.exists("/data/ui_frame_bridge.py")
+        and _is_ui_process()):
+
     # Ensure /data is on the path so ui_stream and ui_frame_bridge can be imported
     if "/data" not in sys.path:
         sys.path.insert(0, "/data")
