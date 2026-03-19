@@ -41,15 +41,10 @@ _capture_logged = False
 def _capture_worker():
     """Background thread that processes raw frame buffers.
 
-    Runs at lowest OS priority (nice 19) so openpilot safety-critical
-    processes always get CPU time first.  Downscales to half resolution
-    before publishing — this cuts H.264 encoding time ~4x.
+    Downscales to half resolution before publishing — this cuts
+    H.264 encoding time ~4x.
     """
     import numpy as np
-    try:
-        os.nice(19)
-    except OSError:
-        pass
     log = logging.getLogger("ui_stream.capture")
     scale = float(os.getenv("STREAM_SCALE", "0.5"))
 
@@ -706,11 +701,6 @@ def _telemetry_collector():
         logger.warning("cereal not available — telemetry collector disabled")
         return
 
-    try:
-        os.nice(19)
-    except OSError:
-        pass
-
     topics = ['deviceState', 'carState', 'controlsState', 'modelV2', 'radarState',
               'liveMapDataSP', 'navInstruction']
     sm = None
@@ -835,10 +825,6 @@ def _telemetry_collector():
 
 def run_server(host="0.0.0.0", port=8082, fps=10):
     """Start the aiohttp/WebRTC server (blocking — run in a thread)."""
-    try:
-        os.nice(19)
-    except OSError:
-        pass
     os.environ["STREAM_FPS"] = str(fps)
 
     # Log to file since UI process stderr isn't easily accessible
