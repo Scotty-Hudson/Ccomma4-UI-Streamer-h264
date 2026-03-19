@@ -142,7 +142,7 @@ body{background:#000;overflow:hidden;height:100vh;width:100vw;margin:0;font-fami
 #set-speed{position:absolute;top:18%;left:1%;background:rgba(0,0,0,0.5);border-radius:12px;padding:6px 14px;text-align:center;border:1px solid rgba(255,255,255,0.15)}
 #set-label{font-size:min(2.5vw,11px);color:#888;text-transform:uppercase;letter-spacing:1px}
 #set-val{font-size:min(7vw,36px);font-weight:600;color:#fff}
-#speed-limit{margin-top:4px;border-top:1px solid rgba(255,255,255,0.1);padding-top:4px;display:none}
+#speed-limit{margin-top:8px;border-top:1px solid rgba(255,255,255,0.15);padding-top:6px}
 #sl-label{font-size:min(2vw,9px);color:#888;text-transform:uppercase;letter-spacing:0.5px}
 #sl-val{font-size:min(5vw,24px);font-weight:500;color:#ff9800}
 
@@ -281,14 +281,8 @@ function poll() {
     sv.textContent = d.setSpeed > 0 ? d.setSpeed : '--';
 
     // Speed limit
-    const slWrap = document.getElementById('speed-limit');
     const slVal = document.getElementById('sl-val');
-    if (d.speedLimit && d.speedLimit > 0) {
-      slVal.textContent = d.speedLimit;
-      slWrap.style.display = 'block';
-    } else {
-      slWrap.style.display = 'none';
-    }
+    slVal.textContent = (d.speedLimit && d.speedLimit > 0) ? d.speedLimit : '--';
 
     // Engage status
     const badge = document.getElementById('engage-badge');
