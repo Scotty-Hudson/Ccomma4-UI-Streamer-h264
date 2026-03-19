@@ -21,16 +21,52 @@ else:
     _TARGET_MODULE = "openpilot.system.ui.lib.application"
     _stream_started = False
     _capture_counter = 0
+    _capture_thread = None
+    _capture_queue = None
 
     # -----------------------------------------------------------------
     # Frame capture helper (called every render frame, throttled)
     # Uses the same approach as sunnypilot's RECORD mode:
     # rl.load_image_from_texture(render_texture.texture)
     # This avoids the Adreno GPU stride bug with glReadPixels.
+    #
+    # IMPORTANT: The GPU readback (load_image_from_texture + buffer copy)
+    # must happen on the UI thread, but the heavy numpy work (reshape,
+    # flip, strip alpha) is offloaded to a background thread so we never
+    # delay the UI process watchdog heartbeat.
     # -----------------------------------------------------------------
     _capture_logged = False
 
+    def _capture_worker():
+        """Background thread that processes raw frame buffers."""
+        import numpy as np
+        from ui_frame_bridge import publish_frame
+        import logging
+        log = logging.getLogger("stream_hook")
+
+        while True:
+            try:
+                raw, w, h = _capture_queue.get()
+                arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 4))
+                rgb = arr[::-1, :, :3].copy()  # flip vertically, drop alpha
+                publish_frame(rgb, w, h)
+            except Exception as e:
+                log.warning("capture worker error: %s", e)
+
+    def _ensure_capture_thread():
+        global _capture_thread, _capture_queue
+        if _capture_thread is not None:
+            return
+        import threading
+        import queue
+        _capture_queue = queue.Queue(maxsize=2)
+        _capture_thread = threading.Thread(
+            target=_capture_worker, daemon=True, name="stream-capture"
+        )
+        _capture_thread.start()
+
     def _do_capture_frame(app):
+        """Grab raw pixels on UI thread (fast), queue heavy work to background."""
         global _capture_counter, _capture_logged
         _capture_counter += 1
         target_fps = int(os.getenv("STREAM_FPS", "10"))
@@ -39,13 +75,11 @@ else:
         if _capture_counter % skip != 0:
             return
         try:
-            import numpy as np
             import pyray as rl
-            from ui_frame_bridge import publish_frame
 
             rt = getattr(app, "_render_texture", None)
             if rt is None:
-                return  # No render texture — nothing to capture
+                return
 
             image = rl.load_image_from_texture(rt.texture)
             w, h = image.width, image.height
@@ -60,15 +94,18 @@ else:
                 )
                 _capture_logged = True
 
-            # Exact same approach as sunnypilot RECORD:
-            # image data is RGBA, w*h*4 bytes
+            # Copy raw bytes on UI thread (fast ~0.5ms for 536x240)
             data_size = w * h * 4
             raw = bytes(rl.ffi.buffer(image.data, data_size))
             rl.unload_image(image)
 
-            arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 4))
-            rgb = arr[::-1, :, :3].copy()  # flip vertically (OpenGL texture is bottom-up), drop alpha
-            publish_frame(rgb, w, h)
+            # Queue heavy numpy work to background thread
+            _ensure_capture_thread()
+            try:
+                _capture_queue.put_nowait((raw, w, h))
+            except Exception:
+                pass  # drop frame if queue full — never block UI thread
+
         except Exception as e:
             import logging
             logging.getLogger("stream_hook").warning("capture error: %s", e, exc_info=True)
@@ -136,9 +173,10 @@ else:
             _orig_frame = getattr(GuiApp, _frame_method)
 
             def _frame_with_capture(self, *args, **kwargs):
+                result = _orig_frame(self, *args, **kwargs)  # heartbeat FIRST
                 if _stream_started:
                     _do_capture_frame(self)
-                return _orig_frame(self, *args, **kwargs)
+                return result
 
             setattr(GuiApp, _frame_method, _frame_with_capture)
 
