@@ -67,7 +67,7 @@ else:
             rl.unload_image(image)
 
             arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 4))
-            rgb = arr[:, :, :3].copy()  # drop alpha, no flip needed
+            rgb = arr[::-1, :, :3].copy()  # flip vertically (OpenGL texture is bottom-up), drop alpha
             publish_frame(rgb, w, h)
         except Exception as e:
             import logging
