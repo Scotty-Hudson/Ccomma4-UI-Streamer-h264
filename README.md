@@ -48,7 +48,7 @@ ssh comma@<your-comma-ip>
 curl -fsSL https://raw.githubusercontent.com/Scotty-Hudson/Ccomma4-UI-Streamer-h264/main/ensure_stream.sh -o /data/ensure_stream.sh
 chmod +x /data/ensure_stream.sh
 
-# Run it (patches application.py, sets env vars, installs boot service)
+# Run it (patches application.py, sets env vars, hooks into boot)
 sudo /data/ensure_stream.sh
 
 # Reboot to activate
@@ -66,19 +66,13 @@ http://<comma-ip>:8082
 `ensure_stream.sh` handles everything in one shot:
 
 1. **Env vars** — adds `STREAM=1` to `launch_env.sh`
-2. **Stream files** — downloads `ui_stream.py`, `ui_frame_bridge.py`, and `stream_patch.py` to `/data/`
-3. **Code patch** — patches `application.py` with stream hooks (creates a `.bak` backup first)
-4. **Boot service** — installs a systemd service that re-runs on every boot, **before** openpilot starts
+2. **Boot patch** — adds a one-liner to `launch_env.sh` that re-runs `stream_patch.py` every time openpilot starts (idempotent — exits instantly if already patched)
+3. **Stream files** — downloads `ui_stream.py`, `ui_frame_bridge.py`, and `stream_patch.py` to `/data/`
+4. **Code patch** — patches `application.py` with stream hooks (creates a `.bak` backup first)
 
-The patch only injects code into the UI process (`selfdrive.ui.ui`). **Zero code runs in controlsd, paramsd, or any other safety-critical process.** When a sunnypilot update replaces `application.py` with stock code, the next reboot re-applies the patch automatically.
+The boot-patch line lives in `launch_env.sh` on `/data/`, so it **survives all reboots and overlay resets**. No systemd service needed. When a sunnypilot update replaces `application.py` with stock code, the next openpilot launch re-applies the patch automatically.
 
-### After an AGNOS update
-
-AGNOS updates (rare — a few times a year) may wipe the systemd service. Just re-run:
-
-```bash
-sudo /data/ensure_stream.sh
-```
+The patch only injects code into the UI process (`selfdrive.ui.ui`). **Zero code runs in controlsd, paramsd, or any other safety-critical process.**
 
 ---
 
@@ -156,7 +150,8 @@ The patch **only runs inside the UI process** (`selfdrive.ui.ui`). Zero code tou
 - Check logs: `journalctl -n 50 | grep -i stream`
 
 **After sunnypilot update, stream stopped**
-- Run `sudo /data/ensure_stream.sh` and reboot. The boot service should do this automatically, but if it's missing after an AGNOS update, this restores it.
+- The boot-patch in `launch_env.sh` should re-apply automatically on the next openpilot start. If it didn't, check that `launch_env.sh` still contains the `stream_patch.py` line: `grep stream_patch /data/openpilot/launch_env.sh`
+- If missing, re-run: `sudo /data/ensure_stream.sh`
 
 ---
 
@@ -170,14 +165,9 @@ rm -f /data/ui_stream.py /data/ui_frame_bridge.py /data/stream_patch.py /data/en
 APP=$(find /data/openpilot -name "application.py.bak" -path "*/ui/lib/*" 2>/dev/null | head -1)
 [ -n "$APP" ] && cp "$APP" "${APP%.bak}"
 
-# Remove STREAM vars from launch_env.sh
+# Remove STREAM vars and boot-patch from launch_env.sh
 sed -i '/^export STREAM/d' /data/openpilot/launch_env.sh
-
-# Remove the boot service
-sudo mount -o remount,rw /
-sudo systemctl disable ensure-stream.service
-sudo rm -f /etc/systemd/system/ensure-stream.service
-sudo systemctl daemon-reload
+sed -i '/stream_patch\.py/d' /data/openpilot/launch_env.sh
 
 sudo reboot
 ```
