@@ -15,46 +15,41 @@ import os
 import sys
 
 
-def _is_ui_process():
-    """Check if the current process is the UI process.
+def _is_safe_to_hook():
+    """Check if it's safe to install the streaming hook in this process.
 
     The .pth file loads this module into every Python process (controlsd,
     paramsd, plannerd, radard, etc.).  We MUST NOT modify sys.path,
     sys.meta_path, or import extra modules in safety-critical processes —
     doing so can cause timing violations that trigger disengagements.
+
+    Strategy: DENY-LIST safety-critical processes.  If this process is NOT
+    in the deny list, allow the hook.  The hook is harmless in non-UI
+    processes because the meta_path finder returns None for every import
+    except the UI application module.
     """
+    _BLOCKED = (
+        "controlsd", "paramsd", "plannerd", "radard",
+        "dmonitoringd", "card", "calibrationd", "locationd",
+        "hardwared", "thermald", "modeld", "navmodeld",
+        "ubloxd", "pandad", "pigeond", "sensord",
+        "boardd", "loggerd", "encoderd", "proclogd",
+        "logmessaged", "tombstoned", "updated", "uploader",
+        "athenad", "manage_athenad", "deleter",
+        "rawgpsd", "laikad", "torqued",
+    )
     try:
         with open("/proc/self/cmdline", "rb") as f:
-            parts = f.read().split(b"\x00")
-        cmdline = b" ".join(parts).decode("utf-8", errors="replace").lower()
-        # UI process cmdline contains the UI module path
-        # e.g. "python3 -m selfdrive.ui.onroad"  or  "system.ui.main"
-        if "selfdrive.ui" in cmdline or "system.ui" in cmdline:
-            return True
-        # Safety-critical processes we must NEVER activate in
-        _BLOCKED = ("controlsd", "paramsd", "plannerd", "radard",
-                     "dmonitoringd", "card", "calibrationd", "locationd",
-                     "hardwared", "thermald", "modeld", "navmodeld",
-                     "ubloxd", "pandad", "pigeond", "sensord",
-                     "boardd", "loggerd", "encoderd", "proclogd",
-                     "logmessaged", "tombstoned", "updated", "uploader")
-        if any(p in cmdline for p in _BLOCKED):
-            return False
-        # Unknown process — check if it might import the UI module
-        # by looking for generic "ui" in arguments (but not in paths like /usr/lib)
-        for part in parts:
-            arg = part.decode("utf-8", errors="replace").lower()
-            if arg.endswith("/ui") or arg.endswith(".ui") or arg == "ui":
-                return True
-        return False
+            cmdline = f.read().decode("utf-8", errors="replace").lower()
+        return not any(blocked in cmdline for blocked in _BLOCKED)
     except Exception:
         return False
 
 
-# Quick exit: only proceed if stream files are deployed AND we're the UI process
+# Quick exit: only proceed if stream files are deployed AND we're not a blocked process
 if (os.path.exists("/data/ui_stream.py")
         and os.path.exists("/data/ui_frame_bridge.py")
-        and _is_ui_process()):
+        and _is_safe_to_hook()):
 
     # Ensure /data is on the path so ui_stream and ui_frame_bridge can be imported
     if "/data" not in sys.path:
