@@ -3,6 +3,7 @@
 Frames are published by stream_hook.py via ui_frame_bridge.  This module
 provides the WebRTC signaling server that feeds those frames to browsers.
 """
+import fractions
 import io
 import os
 import asyncio
@@ -29,10 +30,13 @@ class CameraTrack(MediaStreamTrack):
 
     def __init__(self, fps=10):
         super().__init__()
-        self._frame_interval = 1.0 / max(fps, 1)
+        self._fps = max(fps, 1)
+        self._frame_interval = 1.0 / self._fps
         self._last_sent = 0.0
         self._last_source_ts = 0.0
         self._recv_count = 0
+        self._pts = 0
+        self._time_base = fractions.Fraction(1, 90000)  # standard RTP clock
 
     async def recv(self):
         loop = asyncio.get_event_loop()
@@ -65,13 +69,13 @@ class CameraTrack(MediaStreamTrack):
                 w -= 1
 
             frame = VideoFrame.from_ndarray(arr, format="rgb24")
-            pts, time_base = await self.next_timestamp()
-            frame.pts = pts
-            frame.time_base = time_base
+            frame.pts = self._pts
+            frame.time_base = self._time_base
+            self._pts += int(90000 / self._fps)
 
             self._recv_count += 1
             if self._recv_count <= 5:
-                logger.info("recv: sending frame #%d %dx%d pts=%s", self._recv_count, w, h, pts)
+                logger.info("recv: sending frame #%d %dx%d pts=%s", self._recv_count, w, h, frame.pts)
 
             self._last_sent = time.time()
             self._last_source_ts = ts
