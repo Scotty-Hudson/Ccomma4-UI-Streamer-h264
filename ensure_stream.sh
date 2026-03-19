@@ -2,60 +2,73 @@
 # Ensures UI Streamer persists across all sunnypilot updates and reboots.
 # Lives in /data/ — never wiped by updates.
 #
-# What this does (on every boot):
-#   1. Injects STREAM=1 into launch_env.sh (env vars)
-#   2. Downloads ui_stream.py if missing
-#   3. Patches application.py with stream hooks (if not already patched)
-#   4. Installs itself as a systemd service (runs before openpilot)
+# How it works (zero application.py patching):
+#   1. Downloads stream files to /data/ if missing
+#   2. Installs a .pth file in Python site-packages that loads stream_hook.py
+#      at Python startup — this monkeypatches GuiApplication at import time
+#   3. Installs itself as a systemd service
+#
+# The .pth file and /data/ files are OUTSIDE the openpilot git repo,
+# so they survive git resets, overlay swaps, and sunnypilot updates.
 
 set -e
 
 STREAM_REPO="https://raw.githubusercontent.com/Scotty-Hudson/Ccomma4-UI-Streamer-h264/h264"
 
-# ---------- 1. Patch launch_env.sh with STREAM env vars ----------
+# ---------- 1. Ensure stream files exist in /data/ ----------
 
-patch_env() {
-  local f="$1"
-  [ -f "$f" ] || return
-  grep -q '^export STREAM=1' "$f" || echo 'export STREAM=1' >> "$f"
-  grep -q '^export STREAM_QUALITY=' "$f" || echo 'export STREAM_QUALITY=100' >> "$f"
-  grep -q '^export STREAM_FPS=' "$f" || echo 'export STREAM_FPS=20' >> "$f"
-}
+for f in ui_stream.py ui_frame_bridge.py stream_hook.py; do
+  if [ ! -f "/data/$f" ]; then
+    echo "[ensure_stream] Downloading $f..."
+    curl -fsSL "$STREAM_REPO/$f" -o "/data/$f"
+    echo "[ensure_stream] $f downloaded"
+  else
+    echo "[ensure_stream] $f exists"
+  fi
+done
 
-# Patch live copy
-patch_env /data/openpilot/launch_env.sh
+echo "[ensure_stream] stream files OK"
 
-# Patch any staged update waiting to be swapped in
-patch_env /data/safe_staging/finalized/launch_env.sh
+# ---------- 2. Install .pth file in Python site-packages ----------
 
-echo "[ensure_stream] env vars OK"
+# Find Python 3 site-packages directory
+SITE_DIR=$(python3 -c "import site; print(site.getsitepackages()[0])" 2>/dev/null)
 
-# ---------- 2. Ensure ui_stream.py exists ----------
-
-if [ ! -f /data/ui_stream.py ]; then
-  echo "[ensure_stream] Downloading ui_stream.py..."
-  curl -sL "$STREAM_REPO/ui_stream.py" -o /data/ui_stream.py
-  echo "[ensure_stream] ui_stream.py downloaded"
-else
-  echo "[ensure_stream] ui_stream.py exists"
+if [ -z "$SITE_DIR" ]; then
+  echo "[ensure_stream] ERROR: could not find Python site-packages"
+  exit 1
 fi
 
-# ---------- 3. Ensure stream_patch.py exists ----------
+PTH_FILE="$SITE_DIR/comma_stream.pth"
 
-if [ ! -f /data/stream_patch.py ]; then
-  echo "[ensure_stream] Downloading stream_patch.py..."
-  curl -sL "$STREAM_REPO/stream_patch.py" -o /data/stream_patch.py
-  echo "[ensure_stream] stream_patch.py downloaded"
+# .pth contents: add /data to path, then import the hook module
+PTH_CONTENT="/data
+import stream_hook"
+
+if [ ! -f "$PTH_FILE" ] || [ "$(cat "$PTH_FILE" 2>/dev/null)" != "$PTH_CONTENT" ]; then
+  echo "[ensure_stream] Installing .pth file to $PTH_FILE..."
+  mount -o remount,rw / 2>/dev/null || true
+  echo "$PTH_CONTENT" > "$PTH_FILE"
+  echo "[ensure_stream] .pth file installed"
 else
-  echo "[ensure_stream] stream_patch.py exists"
+  echo "[ensure_stream] .pth file exists"
 fi
 
-# ---------- 4. Patch application.py (idempotent) ----------
+echo "[ensure_stream] Python hook OK"
 
-echo "[ensure_stream] Checking application.py patch..."
-python3 /data/stream_patch.py
+# ---------- 3. Restore application.py if previously patched ----------
 
-# ---------- 5. Install systemd service (if missing) ----------
+# Clean up old patches from application.py (from the old stream_patch.py approach)
+for app_py in /data/openpilot/system/ui/lib/application.py /data/openpilot/openpilot/system/ui/lib/application.py; do
+  bak="${app_py}.bak"
+  if [ -f "$bak" ]; then
+    echo "[ensure_stream] Restoring $app_py from backup (removing old patches)..."
+    cp "$bak" "$app_py"
+    rm -f "$bak"
+  fi
+done
+
+# ---------- 4. Install systemd service (if missing) ----------
 
 SERVICE=/etc/systemd/system/ensure-stream.service
 if [ ! -f "$SERVICE" ]; then

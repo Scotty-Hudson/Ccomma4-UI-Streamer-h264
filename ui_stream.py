@@ -1,75 +1,61 @@
 """WebRTC stream server (H.264 preferred) for sunnypilot UI with telemetry overlay.
-Imported lazily when STREAM=1."""
-import threading
+
+Frames are published by stream_hook.py via ui_frame_bridge.  This module
+provides the WebRTC signaling server that feeds those frames to browsers.
+"""
 import io
 import os
 import asyncio
-
 import json
+import logging
+import time
 
-import numpy as np
 from aiohttp import web
-from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack
+from aiortc import RTCPeerConnection, RTCSessionDescription, RTCRtpSender, MediaStreamTrack
 from av import VideoFrame
 from PIL import Image
-import pyray as rl
+
+from ui_frame_bridge import wait_for_frame, get_latest_frame, snapshot_jpeg
+
+logger = logging.getLogger("ui_webrtc")
 
 
 # ---------------------------------------------------------------------------
-# Frame relay: thread-safe bridge between sync render loop and async WebRTC
-# ---------------------------------------------------------------------------
-
-class FrameRelay:
-    def __init__(self):
-        self._arr = None
-        self._cond = threading.Condition()
-
-    def push(self, rgb_array):
-        with self._cond:
-            self._arr = rgb_array
-            self._cond.notify_all()
-
-    def wait_and_get(self, timeout=2.0):
-        with self._cond:
-            self._cond.wait(timeout=timeout)
-            return self._arr
-
-    def get(self):
-        with self._cond:
-            return self._arr
-
-    def snapshot_jpeg(self, quality=50):
-        arr = self.get()
-        if arr is None:
-            return None
-        img = Image.fromarray(arr)
-        buf = io.BytesIO()
-        img.save(buf, "JPEG", quality=quality)
-        return buf.getvalue()
-
-
-# ---------------------------------------------------------------------------
-# WebRTC video track fed by the FrameRelay
+# WebRTC video track fed by ui_frame_bridge
 # ---------------------------------------------------------------------------
 
 class CameraTrack(MediaStreamTrack):
     kind = "video"
 
-    def __init__(self, relay):
+    def __init__(self, fps=10):
         super().__init__()
-        self._relay = relay
+        self._frame_interval = 1.0 / max(fps, 1)
+        self._last_sent = 0.0
+        self._last_source_ts = 0.0
 
     async def recv(self):
-        loop = asyncio.get_event_loop()
-        arr = await loop.run_in_executor(None, self._relay.wait_and_get, 2.0)
-        if arr is None:
-            frame = VideoFrame(width=1920, height=1080, format="rgb24")
-        else:
+        while True:
+            now = time.time()
+            sleep_for = self._frame_interval - (now - self._last_sent)
+            if sleep_for > 0:
+                await asyncio.sleep(min(sleep_for, 0.01))
+
+            loop = asyncio.get_event_loop()
+            arr, w, h, ts = await loop.run_in_executor(None, wait_for_frame, 2.0)
+            if arr is None or w <= 0 or h <= 0:
+                continue
+            if ts == self._last_source_ts:
+                await asyncio.sleep(0.005)
+                continue
+
             frame = VideoFrame.from_ndarray(arr, format="rgb24")
-        pts, time_base = await self.next_timestamp()
-        frame.pts = pts
-        frame.time_base = time_base
-        return frame
+            pts, time_base = await self.next_timestamp()
+            frame.pts = pts
+            frame.time_base = time_base
+
+            self._last_sent = time.time()
+            self._last_source_ts = ts
+            return frame
 
 
 # ---------------------------------------------------------------------------
@@ -344,8 +330,20 @@ async def _handle_offer(request):
             await pc.close()
             _pcs.discard(pc)
 
-    relay = request.app["relay"]
-    pc.addTrack(CameraTrack(relay))
+    fps = int(os.getenv("STREAM_FPS", "10"))
+    sender = pc.addTrack(CameraTrack(fps=fps))
+
+    # Prefer H.264 via codec preferences
+    transceiver = next((t for t in pc.getTransceivers() if t.sender == sender), None)
+    if transceiver is not None:
+        try:
+            capabilities = RTCRtpSender.getCapabilities("video")
+            if capabilities is not None:
+                preferred = [c for c in capabilities.codecs if c.mimeType.lower() == "video/h264"]
+                if preferred:
+                    transceiver.setCodecPreferences(preferred)
+        except Exception:
+            pass
 
     offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
     await pc.setRemoteDescription(offer)
@@ -441,9 +439,8 @@ async def _handle_icon_png(request):
 
 
 async def _handle_snapshot(request):
-    relay = request.app["relay"]
     quality = int(request.query.get("q", "50"))
-    jpeg = relay.snapshot_jpeg(quality)
+    jpeg = snapshot_jpeg(quality)
     if jpeg:
         return web.Response(
             body=jpeg,
@@ -453,6 +450,17 @@ async def _handle_snapshot(request):
     return web.Response(status=503)
 
 
+async def _handle_health(request):
+    arr, w, h, ts = get_latest_frame()
+    return web.json_response({
+        "ok": True,
+        "has_frame": arr is not None and w > 0 and h > 0,
+        "width": w,
+        "height": h,
+        "last_frame_ts": ts,
+    })
+
+
 async def _on_shutdown(app):
     coros = [pc.close() for pc in _pcs]
     await asyncio.gather(*coros)
@@ -460,18 +468,27 @@ async def _on_shutdown(app):
 
 
 # ---------------------------------------------------------------------------
-# Background server (runs in its own thread with a new event loop)
+# Server entry point (called from stream_hook.py in a background thread)
 # ---------------------------------------------------------------------------
 
-def _run_server(relay, port):
+def run_server(host="0.0.0.0", port=8082, fps=10):
+    """Start the aiohttp/WebRTC server (blocking — run in a thread)."""
+    os.environ["STREAM_FPS"] = str(fps)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    logger.info("Starting UI WebRTC server on %s:%s at %s fps", host, port, fps)
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     app = web.Application()
-    app["relay"] = relay
     app.router.add_get("/", _handle_index)
     app.router.add_post("/offer", _handle_offer)
     app.router.add_get("/telemetry", _handle_telemetry)
     app.router.add_get("/snapshot", _handle_snapshot)
+    app.router.add_get("/health", _handle_health)
     app.router.add_get("/manifest.json", _handle_manifest)
     app.router.add_get("/sw.js", _handle_sw)
     app.router.add_get("/icon.svg", _handle_icon_svg)
@@ -479,40 +496,16 @@ def _run_server(relay, port):
     app.on_shutdown.append(_on_shutdown)
     runner = web.AppRunner(app)
     loop.run_until_complete(runner.setup())
-    site = web.TCPSite(runner, "0.0.0.0", port)
+    site = web.TCPSite(runner, host, port)
     loop.run_until_complete(site.start())
     loop.run_forever()
 
 
-# ---------------------------------------------------------------------------
-# Public API (called from openpilot render loop)
-# ---------------------------------------------------------------------------
-
-_relay = None
-_counter = 0
-
-
-def start(port=8082):
-    """Start the WebRTC signaling server in a background thread."""
-    global _relay
-    _relay = FrameRelay()
-    t = threading.Thread(target=_run_server, args=(_relay, port), daemon=True)
-    t.start()
-
-
-def capture_frame(app, quality=50, target_fps=10):
-    """Capture a frame from the render texture for WebRTC streaming."""
-    global _counter
-    if _relay is None or app._render_texture is None:
-        return
-    _counter += 1
-    skip = max(1, app._target_fps // target_fps)
-    if _counter % skip != 0:
-        return
-    si = rl.load_image_from_texture(app._render_texture.texture)
-    raw = bytes(rl.ffi.buffer(si.data, si.width * si.height * 4))
-    w, h = si.width, si.height
-    rl.unload_image(si)
-    arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 4))
-    arr = arr[::-1, :, :3].copy()
-    _relay.push(arr)
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Comma UI WebRTC streamer")
+    parser.add_argument("--host", default=os.getenv("STREAM_HOST", "0.0.0.0"))
+    parser.add_argument("--port", type=int, default=int(os.getenv("STREAM_PORT", "8082")))
+    parser.add_argument("--fps", type=int, default=int(os.getenv("STREAM_FPS", "10")))
+    args = parser.parse_args()
+    run_server(args.host, args.port, args.fps)
