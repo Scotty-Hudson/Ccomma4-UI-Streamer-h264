@@ -315,7 +315,7 @@ function poll() {
     if (d.memUsed !== undefined) { var e=document.getElementById("pf-mem"); e.textContent=d.memUsed+"%"; e.className="pf-val"+(d.memUsed>85?" bad":""); }
 
   }).catch(() => {});
-  setTimeout(poll, 250);
+  setTimeout(poll, 500);
 }
 
 document.addEventListener("DOMContentLoaded",function(){
@@ -397,7 +397,8 @@ async def _handle_telemetry(request):
     except FileNotFoundError:
         return web.json_response(
             {"setSpeed": 0, "cruiseEnabled": False, "driveState": "off",
-             "aEgo": 0, "vEgo": 0, "gas": 0, "brake": 0},
+             "aEgo": 0, "vEgo": 0, "gas": 0, "brake": 0,
+             "cpuTemp": 0, "cpuUsage": 0, "memUsed": 0},
             headers=_HEADERS,
         )
     except Exception:
@@ -502,6 +503,114 @@ async def _on_shutdown(app):
 
 
 # ---------------------------------------------------------------------------
+# Telemetry collector — reads cereal messages, writes /tmp/telemetry.json
+# ---------------------------------------------------------------------------
+
+def _telemetry_collector():
+    """Background thread: subscribe to cereal and write /tmp/telemetry.json.
+
+    System metrics (CPU temp/usage, memory) come from deviceState and are
+    always available — even in standby with the car off.  Driving metrics
+    (speed, gas, brake, cruise, lead) only populate when the vehicle is on.
+    """
+    try:
+        import cereal.messaging as messaging
+    except ImportError:
+        logger.warning("cereal not available — telemetry collector disabled")
+        return
+
+    topics = ['deviceState', 'carState', 'controlsState', 'modelV2', 'radarState']
+    sm = messaging.SubMaster(topics)
+    logger.info("telemetry collector started, topics=%s", topics)
+
+    while True:
+        sm.update(0)  # non-blocking poll
+        data = {}
+
+        # ---- System metrics (hardwared/thermald — always running) ----
+        try:
+            if sm.alive['deviceState']:
+                ds = sm['deviceState']
+                temps = list(ds.cpuTempC)
+                if temps:
+                    data['cpuTemp'] = round(max(temps), 1)
+                cpus = list(ds.cpuUsagePercent)
+                if cpus:
+                    data['cpuUsage'] = int(round(sum(cpus) / len(cpus)))
+                data['memUsed'] = int(round(ds.memoryUsagePercent))
+        except Exception:
+            pass
+
+        # ---- Car state (only when vehicle/panda connected) ----
+        try:
+            if sm.alive['carState']:
+                cs = sm['carState']
+                data['vEgo'] = round(cs.vEgo, 2)
+                data['aEgo'] = round(cs.aEgo, 2)
+                data['gas'] = int(round(cs.gas * 100))
+                brake_val = getattr(cs, 'brake', 0.0)
+                data['brake'] = int(round(brake_val * 100))
+                if cs.brakePressed and data['brake'] < 10:
+                    data['brake'] = 100
+                data['setSpeed'] = int(round(cs.cruiseState.speed * 2.23694))  # m/s → mph
+                data['cruiseEnabled'] = bool(cs.cruiseState.enabled)
+        except Exception:
+            pass
+
+        # ---- Controls state ----
+        try:
+            if sm.alive['controlsState']:
+                ctrl = sm['controlsState']
+                data['driveState'] = 'active' if ctrl.enabled else 'standby'
+        except Exception:
+            pass
+
+        # ---- Model execution time (only while driving) ----
+        try:
+            if sm.alive['modelV2']:
+                mv = sm['modelV2']
+                exec_time = getattr(mv, 'modelExecutionTime', 0)
+                if exec_time > 0:
+                    data['modelExec'] = round(exec_time * 1000, 1)  # s → ms
+        except Exception:
+            pass
+
+        # ---- Lead vehicle ----
+        try:
+            if sm.alive['radarState']:
+                rs = sm['radarState']
+                lead = rs.leadOne
+                if lead.status:
+                    data['leadDist'] = round(lead.dRel, 1)
+        except Exception:
+            pass
+
+        # Defaults for fields the frontend expects
+        data.setdefault('driveState', 'off')
+        data.setdefault('cruiseEnabled', False)
+        data.setdefault('setSpeed', 0)
+        data.setdefault('vEgo', 0)
+        data.setdefault('aEgo', 0)
+        data.setdefault('gas', 0)
+        data.setdefault('brake', 0)
+
+        # Atomic write
+        try:
+            import tempfile
+            fd = tempfile.NamedTemporaryFile(
+                mode='w', dir='/tmp', prefix='.telemetry_',
+                suffix='.json', delete=False,
+            )
+            json.dump(data, fd)
+            fd.close()
+            os.replace(fd.name, '/tmp/telemetry.json')
+        except Exception as e:
+            logger.warning("telemetry write error: %s", e)
+
+        time.sleep(0.5)  # match client polling interval
+
+
+# ---------------------------------------------------------------------------
 # Server entry point (called from stream_hook.py in a background thread)
 # ---------------------------------------------------------------------------
 
@@ -533,6 +642,12 @@ def run_server(host="0.0.0.0", port=8082, fps=10):
     loop.run_until_complete(runner.setup())
     site = web.TCPSite(runner, host, port)
     loop.run_until_complete(site.start())
+
+    # Start telemetry collector (reads cereal → writes /tmp/telemetry.json)
+    import threading
+    tc = threading.Thread(target=_telemetry_collector, daemon=True, name="telemetry-collector")
+    tc.start()
+
     loop.run_forever()
 
 
