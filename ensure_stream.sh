@@ -20,7 +20,7 @@ STREAM_REPO="https://raw.githubusercontent.com/Scotty-Hudson/Ccomma4-UI-Streamer
 # Always re-download to pick up fixes.  Atomic: write to .tmp then mv,
 # so existing file is preserved if curl fails (e.g. no internet).
 
-for f in ui_stream.py ui_frame_bridge.py stream_hook.py; do
+for f in ui_stream.py ui_frame_bridge.py stream_hook.py stream_hook_impl.py; do
   echo "[ensure_stream] Updating $f from $STREAM_BRANCH ..."
   if curl -fsSL "$STREAM_REPO/$f" -o "/data/$f.tmp"; then
     mv "/data/$f.tmp" "/data/$f"
