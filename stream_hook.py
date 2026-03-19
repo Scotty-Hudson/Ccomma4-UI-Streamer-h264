@@ -25,8 +25,11 @@ else:
     # -----------------------------------------------------------------
     # Frame capture helper (called every render frame, throttled)
     # -----------------------------------------------------------------
+    _SNAP_PATH = b"/tmp/_stream_cap.png"
+    _capture_logged = False
+
     def _do_capture_frame(app):
-        global _capture_counter
+        global _capture_counter, _capture_logged
         _capture_counter += 1
         target_fps = int(os.getenv("STREAM_FPS", "10"))
         ui_fps = getattr(app, "target_fps", None) or getattr(app, "_target_fps", 30)
@@ -36,49 +39,34 @@ else:
         try:
             import numpy as np
             import pyray as rl
+            from PIL import Image as PILImage
             from ui_frame_bridge import publish_frame
 
-            rt = getattr(app, "_render_texture", None)
-            need_vflip = False
-            if rt is not None:
-                image = rl.load_image_from_texture(rt.texture)
-                need_vflip = True  # OpenGL texture is bottom-up
-            else:
-                image = rl.load_image_from_screen()
-                need_vflip = False  # raylib already flips screen captures
-
+            # Capture the screen via raylib
+            image = rl.load_image_from_screen()
             w, h = image.width, image.height
-            fmt = image.format
             if w <= 0 or h <= 0:
                 rl.unload_image(image)
                 return
 
-            # Determine bytes per pixel from raylib PixelFormat
-            # 7 = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8 (4 bpp)
-            # 4 = PIXELFORMAT_UNCOMPRESSED_R8G8B8   (3 bpp)
-            if fmt == 7:
-                bpp = 4
-            elif fmt == 4:
-                bpp = 3
-            else:
-                # Export to consistent RGBA format
-                rl.image_format(rl.ffi.addressof(image), 7)
-                bpp = 4
-                fmt = 7
+            if not _capture_logged:
+                import logging
+                logging.getLogger("stream_hook").info(
+                    "first capture: %dx%d fmt=%d render=%dx%d",
+                    w, h, image.format,
+                    rl.get_render_width(), rl.get_render_height(),
+                )
+                _capture_logged = True
 
-            raw = bytes(rl.ffi.buffer(image.data, w * h * bpp))
+            # Use raylib's own export to PNG (handles format/stride correctly)
+            # /tmp is tmpfs on comma — no flash wear
+            rl.export_image(image, _SNAP_PATH)
             rl.unload_image(image)
 
-            if bpp == 4:
-                arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 4))
-                rgb = arr[:, :, :3]  # drop alpha
-            else:
-                rgb = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 3))
-
-            if need_vflip:
-                rgb = rgb[::-1, :, :]
-
-            publish_frame(rgb.copy(), w, h)
+            # Decode with PIL (guaranteed correct)
+            img = PILImage.open(_SNAP_PATH).convert("RGB")
+            rgb = np.array(img)
+            publish_frame(rgb, img.width, img.height)
         except Exception as e:
             import logging
             logging.getLogger("stream_hook").warning("capture error: %s", e, exc_info=True)
