@@ -114,6 +114,13 @@ def _prefer_h264(sdp):
 
 _pcs = set()
 
+# ---------------------------------------------------------------------------
+# SSE telemetry infrastructure
+# ---------------------------------------------------------------------------
+_sse_clients: list[asyncio.Queue] = []  # one queue per connected SSE client
+_telemetry_latest: dict = {}            # latest snapshot, shared with SSE handler
+_telemetry_event = None                 # asyncio.Event, set from collector thread
+
 
 # ---------------------------------------------------------------------------
 # Inline HTML page — WebRTC viewer with telemetry HUD
@@ -270,10 +277,9 @@ async function startWebRTC() {
   }
 }
 
-/* ---------- Telemetry polling ---------- */
+/* ---------- Telemetry (SSE) ---------- */
 let lastData = null;
-function poll() {
-  fetch('/telemetry').then(r => r.json()).then(d => {
+function applyTelemetry(d) {
     lastData = d;
 
     // Set speed
@@ -324,16 +330,24 @@ function poll() {
     if (d.frameDropPerc !== undefined) { var e=document.getElementById("pf-drops"); e.textContent=d.frameDropPerc+"%"; e.className="pf-val"+(d.frameDropPerc>5?" bad":""); }
     if (d.cpuUsage !== undefined) { var e=document.getElementById("pf-cpu"); e.textContent=d.cpuUsage+"%"; e.className="pf-val"+(d.cpuUsage>85?" bad":""); }
     if (d.memUsed !== undefined) { var e=document.getElementById("pf-mem"); e.textContent=d.memUsed+"%"; e.className="pf-val"+(d.memUsed>85?" bad":""); }
+}
 
-  }).catch(() => {});
-  setTimeout(poll, 500);
+function startSSE() {
+  const es = new EventSource('/telemetry/stream');
+  es.onmessage = function(e) {
+    try { applyTelemetry(JSON.parse(e.data)); } catch(ex) {}
+  };
+  es.onerror = function() {
+    es.close();
+    setTimeout(startSSE, 2000);
+  };
 }
 
 document.addEventListener("DOMContentLoaded",function(){
   startWebRTC();
   setTimeout(function(){window.scrollTo(0,1);},100);
   setTimeout(function(){window.scrollTo(0,0);},200);
-  poll();
+  startSSE();
   if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js').catch(function(){});}
 });
 function toggleFS(){var d=document.documentElement;try{if(!document.fullscreenElement&&!document.webkitFullscreenElement){if(d.requestFullscreen)d.requestFullscreen();else if(d.webkitRequestFullscreen)d.webkitRequestFullscreen(Element.ALLOW_KEYBOARD_INPUT);else if(d.webkitEnterFullscreen)d.webkitEnterFullscreen();else alert('Fullscreen not supported');}else{if(document.exitFullscreen)document.exitFullscreen();else if(document.webkitExitFullscreen)document.webkitExitFullscreen();}}catch(e){alert('FS error: '+e);}}
@@ -396,24 +410,51 @@ async def _handle_offer(request):
 
 
 async def _handle_telemetry(request):
+    """One-shot JSON endpoint (kept for debugging / curl)."""
     _HEADERS = {"Cache-Control": "no-cache", "Access-Control-Allow-Origin": "*"}
+    if _telemetry_latest:
+        return web.json_response(_telemetry_latest, headers=_HEADERS)
+    return web.json_response(
+        {"setSpeed": 0, "cruiseEnabled": False, "driveState": "off",
+         "aEgo": 0, "vEgo": 0, "gas": 0, "brake": 0,
+         "cpuTemp": 0, "cpuUsage": 0, "memUsed": 0},
+        headers=_HEADERS,
+    )
+
+
+async def _handle_telemetry_stream(request):
+    """SSE endpoint — pushes telemetry JSON as it arrives."""
+    resp = web.StreamResponse(
+        status=200,
+        reason='OK',
+        headers={
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'Access-Control-Allow-Origin': '*',
+        },
+    )
+    await resp.prepare(request)
+
+    q: asyncio.Queue = asyncio.Queue(maxsize=4)
+    _sse_clients.append(q)
+    logger.info("SSE client connected (%d total)", len(_sse_clients))
+
     try:
-        with open("/tmp/telemetry.json", "r") as fh:
-            data = fh.read()
-        return web.Response(
-            text=data,
-            content_type="application/json",
-            headers=_HEADERS,
-        )
-    except FileNotFoundError:
-        return web.json_response(
-            {"setSpeed": 0, "cruiseEnabled": False, "driveState": "off",
-             "aEgo": 0, "vEgo": 0, "gas": 0, "brake": 0,
-             "cpuTemp": 0, "cpuUsage": 0, "memUsed": 0},
-            headers=_HEADERS,
-        )
-    except Exception:
-        return web.Response(status=503)
+        # Send current state immediately so the UI populates on connect
+        if _telemetry_latest:
+            await resp.write(f"data: {json.dumps(_telemetry_latest)}\n\n".encode())
+
+        while True:
+            data = await q.get()
+            await resp.write(f"data: {json.dumps(data)}\n\n".encode())
+    except (asyncio.CancelledError, ConnectionResetError, ConnectionError):
+        pass
+    finally:
+        _sse_clients.remove(q)
+        logger.info("SSE client disconnected (%d remaining)", len(_sse_clients))
+
+    return resp
 
 
 # ---------------------------------------------------------------------------
@@ -514,16 +555,17 @@ async def _on_shutdown(app):
 
 
 # ---------------------------------------------------------------------------
-# Telemetry collector — reads cereal messages, writes /tmp/telemetry.json
+# Telemetry collector — reads cereal, pushes to SSE clients
 # ---------------------------------------------------------------------------
 
-def _telemetry_collector():
-    """Background thread: subscribe to cereal and write /tmp/telemetry.json.
+def _telemetry_collector(loop):
+    """Background thread: subscribe to cereal and push to SSE clients.
 
     System metrics (CPU temp/usage, memory) come from deviceState and are
     always available — even in standby with the car off.  Driving metrics
     (speed, gas, brake, cruise, lead) only populate when the vehicle is on.
     """
+    global _telemetry_latest
     try:
         import cereal.messaging as messaging
     except ImportError:
@@ -620,20 +662,24 @@ def _telemetry_collector():
         data.setdefault('gas', 0)
         data.setdefault('brake', 0)
 
-        # Atomic write
-        try:
-            import tempfile
-            fd = tempfile.NamedTemporaryFile(
-                mode='w', dir='/tmp', prefix='.telemetry_',
-                suffix='.json', delete=False,
-            )
-            json.dump(data, fd)
-            fd.close()
-            os.replace(fd.name, '/tmp/telemetry.json')
-        except Exception as e:
-            logger.warning("telemetry write error: %s", e)
+        # Update shared state and push to SSE clients
+        _telemetry_latest = data
+        if _sse_clients:
+            for q in list(_sse_clients):
+                try:
+                    q.put_nowait(data)
+                except asyncio.QueueFull:
+                    # Drop oldest, push newest — keeps UI current
+                    try:
+                        q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+                    try:
+                        q.put_nowait(data)
+                    except asyncio.QueueFull:
+                        pass
 
-        time.sleep(0.5)  # match client polling interval
+        time.sleep(0.5)
 
 
 # ---------------------------------------------------------------------------
@@ -657,6 +703,7 @@ def run_server(host="0.0.0.0", port=8082, fps=10):
     app.router.add_get("/", _handle_index)
     app.router.add_post("/offer", _handle_offer)
     app.router.add_get("/telemetry", _handle_telemetry)
+    app.router.add_get("/telemetry/stream", _handle_telemetry_stream)
     app.router.add_get("/snapshot", _handle_snapshot)
     app.router.add_get("/health", _handle_health)
     app.router.add_get("/manifest.json", _handle_manifest)
@@ -669,9 +716,9 @@ def run_server(host="0.0.0.0", port=8082, fps=10):
     site = web.TCPSite(runner, host, port)
     loop.run_until_complete(site.start())
 
-    # Start telemetry collector (reads cereal → writes /tmp/telemetry.json)
+    # Start telemetry collector (reads cereal → pushes to SSE clients)
     import threading
-    tc = threading.Thread(target=_telemetry_collector, daemon=True, name="telemetry-collector")
+    tc = threading.Thread(target=_telemetry_collector, args=(loop,), daemon=True, name="telemetry-collector")
     tc.start()
 
     loop.run_forever()
