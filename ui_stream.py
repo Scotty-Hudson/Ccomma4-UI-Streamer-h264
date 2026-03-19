@@ -142,6 +142,9 @@ body{background:#000;overflow:hidden;height:100vh;width:100vw;margin:0;font-fami
 #set-speed{position:absolute;top:18%;left:1%;background:rgba(0,0,0,0.5);border-radius:12px;padding:6px 14px;text-align:center;border:1px solid rgba(255,255,255,0.15)}
 #set-label{font-size:min(2.5vw,11px);color:#888;text-transform:uppercase;letter-spacing:1px}
 #set-val{font-size:min(7vw,36px);font-weight:600;color:#fff}
+#speed-limit{margin-top:4px;border-top:1px solid rgba(255,255,255,0.1);padding-top:4px;display:none}
+#sl-label{font-size:min(2vw,9px);color:#888;text-transform:uppercase;letter-spacing:0.5px}
+#sl-val{font-size:min(5vw,24px);font-weight:500;color:#ff9800}
 
 /* Lead car info - center top */
 #lead-info{position:absolute;top:38%;left:50%;transform:translateX(-50%);text-align:center;opacity:0;transition:opacity 0.3s;background:rgba(0,0,0,0.55);padding:6px 14px;border-radius:8px}
@@ -191,6 +194,10 @@ body{background:#000;overflow:hidden;height:100vh;width:100vw;margin:0;font-fami
     <div id="set-speed">
       <div id="set-label">SET</div>
       <div id="set-val">--</div>
+      <div id="speed-limit">
+        <div id="sl-label">LIMIT</div>
+        <div id="sl-val">--</div>
+      </div>
     </div>
 
     <div id="lead-info">
@@ -272,6 +279,16 @@ function poll() {
     // Set speed
     const sv = document.getElementById('set-val');
     sv.textContent = d.setSpeed > 0 ? d.setSpeed : '--';
+
+    // Speed limit
+    const slWrap = document.getElementById('speed-limit');
+    const slVal = document.getElementById('sl-val');
+    if (d.speedLimit && d.speedLimit > 0) {
+      slVal.textContent = d.speedLimit;
+      slWrap.style.display = 'block';
+    } else {
+      slWrap.style.display = 'none';
+    }
 
     // Engage status
     const badge = document.getElementById('engage-badge');
@@ -519,7 +536,8 @@ def _telemetry_collector():
         logger.warning("cereal not available — telemetry collector disabled")
         return
 
-    topics = ['deviceState', 'carState', 'controlsState', 'modelV2', 'radarState']
+    topics = ['deviceState', 'carState', 'controlsState', 'modelV2', 'radarState',
+              'liveMapDataSP', 'navInstruction']
     sm = messaging.SubMaster(topics)
     logger.info("telemetry collector started, topics=%s", topics)
 
@@ -582,6 +600,20 @@ def _telemetry_collector():
                 lead = rs.leadOne
                 if lead.status:
                     data['leadDist'] = round(lead.dRel, 1)
+        except Exception:
+            pass
+
+        # ---- Speed limit (sunnypilot liveMapDataSP or navInstruction) ----
+        try:
+            sl = 0
+            if sm.alive.get('liveMapDataSP', False):
+                lmd = sm['liveMapDataSP']
+                sl = getattr(lmd, 'speedLimit', 0)
+            if sl <= 0 and sm.alive.get('navInstruction', False):
+                ni = sm['navInstruction']
+                sl = getattr(ni, 'speedLimit', 0)
+            if sl > 0:
+                data['speedLimit'] = int(round(sl * 2.23694))  # m/s → mph
         except Exception:
             pass
 
