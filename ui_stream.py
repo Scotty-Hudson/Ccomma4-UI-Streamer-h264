@@ -36,21 +36,24 @@ class CameraTrack(MediaStreamTrack):
 
     async def recv(self):
         loop = asyncio.get_event_loop()
+        logger.debug("recv() called, count=%d", self._recv_count)
         while True:
             now = time.time()
             sleep_for = self._frame_interval - (now - self._last_sent)
             if sleep_for > 0:
                 await asyncio.sleep(sleep_for)
 
+            logger.debug("recv: calling wait_for_frame...")
             arr, w, h, ts = await loop.run_in_executor(None, wait_for_frame, 2.0)
+            logger.debug("recv: wait_for_frame returned arr=%s %dx%d ts=%s", arr is not None, w, h, ts)
             if arr is None or w <= 0 or h <= 0:
-                if self._recv_count == 0:
-                    logger.warning("recv: no frame available (arr=%s, %dx%d)", arr is not None, w, h)
+                logger.warning("recv: no frame available (arr=%s, %dx%d)", arr is not None, w, h)
                 continue
             if ts == self._last_source_ts:
                 await asyncio.sleep(0.02)
                 arr, w, h, ts = await loop.run_in_executor(None, get_latest_frame)
                 if arr is None or ts == self._last_source_ts:
+                    logger.debug("recv: stale frame, skipping")
                     continue
 
             # Ensure dimensions are even (required by H.264 yuv420p)
@@ -67,7 +70,7 @@ class CameraTrack(MediaStreamTrack):
             frame.time_base = time_base
 
             self._recv_count += 1
-            if self._recv_count <= 3:
+            if self._recv_count <= 5:
                 logger.info("recv: sending frame #%d %dx%d pts=%s", self._recv_count, w, h, pts)
 
             self._last_sent = time.time()
@@ -502,10 +505,11 @@ def run_server(host="0.0.0.0", port=8082, fps=10):
     """Start the aiohttp/WebRTC server (blocking — run in a thread)."""
     os.environ["STREAM_FPS"] = str(fps)
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    # Log to file since UI process stderr isn't easily accessible
+    _fh = logging.FileHandler("/tmp/ui_stream.log")
+    _fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logging.root.addHandler(_fh)
+    logging.root.setLevel(logging.DEBUG)
     logger.info("Starting UI WebRTC server on %s:%s at %s fps", host, port, fps)
 
     loop = asyncio.new_event_loop()
