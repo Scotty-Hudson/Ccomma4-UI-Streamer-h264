@@ -1,8 +1,14 @@
 """WebRTC stream server (H.264 preferred) for sunnypilot UI with telemetry overlay.
 
-Frames are captured by calling capture_frame(app) from the patched render loop
-in application.py.  The WebRTC server runs in a background thread started by
-start().
+Dual-purpose module:
+  1. When imported by application.py (UI process):
+     - capture_frame() does GPU readback and writes raw RGBA to shared memory
+     - start() spawns the server as a separate subprocess
+     - Zero encoding work in the UI process
+  2. When run as subprocess (--server):
+     - Reads frames from shared memory
+     - Does numpy downscale + H.264 encoding + WebRTC + SSE telemetry
+     - All CPU-intensive work is isolated here
 
 This module is ONLY imported inside the UI process (selfdrive.ui.ui) via the
 STREAM=1 env-var gate in the patched application.py.  It never runs in
@@ -14,9 +20,9 @@ import os
 import asyncio
 import json
 import logging
+import struct
 import time
 import threading
-import queue
 
 from aiohttp import web
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCRtpSender, MediaStreamTrack
@@ -29,74 +35,48 @@ logger = logging.getLogger("ui_webrtc")
 
 
 # ---------------------------------------------------------------------------
+# Shared memory constants — cross-process frame passing
+# ---------------------------------------------------------------------------
+# Layout: [seq:4][width:4][height:4][viewers:1][pad:3][rgba_data:...]
+#   seq: seqlock counter (odd=writing, even=valid)
+#   viewers: set by server subprocess when clients are connected
+
+_SHM_NAME = "comma_stream"
+_SHM_HEADER = 16
+_SHM_MAX_FRAME = 1920 * 1200 * 4  # ~9.2 MB max
+_SHM_SIZE = _SHM_HEADER + _SHM_MAX_FRAME
+
+# ---------------------------------------------------------------------------
 # Frame capture — called from the patched render loop in application.py
 # ---------------------------------------------------------------------------
+# Runs in the UI process only.  Writes raw RGBA to shared memory.
+# All numpy / H.264 encoding happens in the server subprocess.
 
+_shm = None          # SharedMemory object (created by start())
+_shm_seq = 0         # seqlock write counter
 _capture_counter = 0
-_capture_thread = None
-_capture_queue = None
 _capture_logged = False
-
-
-def _capture_worker():
-    """Background thread that processes raw frame buffers.
-
-    Downscales to half resolution before publishing — this cuts
-    H.264 encoding time ~4x.
-    """
-    import numpy as np
-    log = logging.getLogger("ui_stream.capture")
-    scale = float(os.getenv("STREAM_SCALE", "0.5"))
-
-    while True:
-        try:
-            raw, w, h = _capture_queue.get()
-            arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 4))
-            rgb = arr[::-1, :, :3]  # flip vertically, drop alpha (view, no copy)
-
-            # Downscale — nearest-neighbor via stride slicing (fast, no PIL needed)
-            if 0 < scale < 1:
-                step = max(1, int(round(1.0 / scale)))
-                rgb = rgb[::step, ::step, :]
-                h, w = rgb.shape[0], rgb.shape[1]
-
-            # Ensure even dimensions (required by H.264 yuv420p)
-            if h % 2 != 0:
-                rgb = rgb[:h - 1, :, :]
-                h -= 1
-            if w % 2 != 0:
-                rgb = rgb[:, :w - 1, :]
-                w -= 1
-
-            rgb = np.ascontiguousarray(rgb)
-            publish_frame(rgb, w, h)
-        except Exception as e:
-            log.warning("capture worker error: %s", e)
-
-
-def _ensure_capture_thread():
-    global _capture_thread, _capture_queue
-    if _capture_thread is not None:
-        return
-    _capture_queue = queue.Queue(maxsize=2)
-    _capture_thread = threading.Thread(
-        target=_capture_worker, daemon=True, name="stream-capture"
-    )
-    _capture_thread.start()
+_server_proc = None
+_server_started = False
 
 
 def capture_frame(app, quality=50, target_fps=10):
-    """Call from the render loop to capture a frame.
+    """Capture a frame and write raw RGBA to shared memory.
 
-    NO-OP when no WebRTC peers are connected — zero overhead when nobody
-    is watching.  When active, GPU readback (fast ~0.5ms) happens on the
-    calling (UI) thread; heavy numpy work is offloaded to a background
-    thread so we never delay the UI watchdog heartbeat.
+    This is the ONLY streaming work in the UI process:
+    GPU readback (~0.5ms) + memcpy to shared memory (~0.5ms).
+    No numpy, no encoding, no asyncio.
+
+    NO-OP when no browser clients are connected (server subprocess
+    clears the viewers byte in shared memory).
     """
-    global _capture_counter, _capture_logged
+    global _capture_counter, _capture_logged, _shm_seq
 
-    # Skip everything when nobody is watching — saves ~80MB/s memory bandwidth
-    if not _pcs:
+    if _shm is None:
+        return
+
+    # Server subprocess sets byte 12 when clients are connected
+    if _shm.buf[12] == 0:
         return
 
     import pyray as rl
@@ -116,19 +96,27 @@ def capture_frame(app, quality=50, target_fps=10):
             rl.unload_image(image)
             return
 
+        data_size = w * h * 4
+        if data_size + _SHM_HEADER > _shm.size:
+            rl.unload_image(image)
+            return
+
         if not _capture_logged:
-            logger.info("first capture: %dx%d fmt=%d", w, h, image.format)
+            logger.info("first capture: %dx%d fmt=%d -> shm", w, h, image.format)
             _capture_logged = True
 
-        raw = bytes(rl.ffi.buffer(image.data, w * h * 4))
+        raw = rl.ffi.buffer(image.data, data_size)
+
+        # Seqlock write: odd = writing in progress
+        _shm_seq += 1
+        struct.pack_into('I', _shm.buf, 0, _shm_seq)
+        struct.pack_into('II', _shm.buf, 4, w, h)
+        _shm.buf[_SHM_HEADER:_SHM_HEADER + data_size] = raw
+        # Even = write complete
+        _shm_seq += 1
+        struct.pack_into('I', _shm.buf, 0, _shm_seq)
+
         rl.unload_image(image)
-
-        _ensure_capture_thread()
-        try:
-            _capture_queue.put_nowait((raw, w, h))
-        except Exception:
-            pass  # drop frame if queue full — never block UI thread
-
     except Exception as e:
         logger.warning("capture error: %s", e, exc_info=True)
 
@@ -137,22 +125,48 @@ def capture_frame(app, quality=50, target_fps=10):
 # Server start — called from the patched application.py init
 # ---------------------------------------------------------------------------
 
-_server_started = False
-
 
 def start(port=8082):
-    """Start the WebRTC server in a background thread.  Safe to call multiple times."""
-    global _server_started
+    """Create shared memory and spawn the server as a separate process.
+
+    All encoding, WebRTC, and telemetry work runs in the subprocess.
+    The UI process only writes raw RGBA frames to shared memory.
+    Safe to call multiple times.
+    """
+    global _server_started, _shm, _server_proc
     if _server_started:
         return
+
+    from multiprocessing.shared_memory import SharedMemory
+    import subprocess
+    import sys
+
+    # Create shared memory for frame passing
+    try:
+        _shm = SharedMemory(name=_SHM_NAME, create=True, size=_SHM_SIZE)
+    except FileExistsError:
+        # Clean up stale shm from a previous crash
+        try:
+            old = SharedMemory(name=_SHM_NAME, create=False)
+            old.close()
+            old.unlink()
+        except Exception:
+            pass
+        _shm = SharedMemory(name=_SHM_NAME, create=True, size=_SHM_SIZE)
+
+    _shm.buf[:_SHM_HEADER] = b'\x00' * _SHM_HEADER
+
     fps = int(os.getenv("STREAM_FPS", "5"))
-    t = threading.Thread(
-        target=run_server,
-        kwargs={"port": port, "fps": fps},
-        daemon=True,
-        name="ui-webrtc",
+    scale = os.getenv("STREAM_SCALE", "0.5")
+
+    _server_proc = subprocess.Popen(
+        [sys.executable, '/data/ui_stream.py', '--server',
+         '--port', str(port), '--fps', str(fps), '--scale', scale],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
-    t.start()
+    logger.info("Server subprocess PID %d (port=%s fps=%s scale=%s)",
+                _server_proc.pid, port, fps, scale)
     _server_started = True
 
 
@@ -243,6 +257,14 @@ def _prefer_h264(sdp):
 # ---------------------------------------------------------------------------
 
 _pcs = set()
+_server_shm = None  # SharedMemory reference in server subprocess
+
+
+def _update_viewers_shm():
+    """Update shared memory viewers byte so UI process knows to capture."""
+    if _server_shm is not None:
+        _server_shm.buf[12] = 1 if (_pcs or _sse_clients) else 0
+
 
 # ---------------------------------------------------------------------------
 # SSE telemetry infrastructure
@@ -501,12 +523,14 @@ async def _handle_offer(request):
 
     pc = RTCPeerConnection()
     _pcs.add(pc)
+    _update_viewers_shm()
 
     @pc.on("connectionstatechange")
     async def _on_state():
         if pc.connectionState in ("failed", "closed"):
             await pc.close()
             _pcs.discard(pc)
+            _update_viewers_shm()
 
     fps = int(os.getenv("STREAM_FPS", "10"))
     sender = pc.addTrack(CameraTrack(fps=fps))
@@ -708,6 +732,7 @@ def _telemetry_collector():
     while True:
         # Don't poll cereal when nobody is listening — saves CPU + ZMQ overhead
         if not _sse_clients and not _pcs:
+            _update_viewers_shm()
             time.sleep(2)
             continue
 
@@ -820,19 +845,111 @@ def _telemetry_collector():
 
 
 # ---------------------------------------------------------------------------
-# Server entry point (called via start() from patched application.py)
+# Shared memory frame reader — runs in the server subprocess
 # ---------------------------------------------------------------------------
 
-def run_server(host="0.0.0.0", port=8082, fps=10):
-    """Start the aiohttp/WebRTC server (blocking — run in a thread)."""
+def _shm_frame_reader(scale_val):
+    """Background thread in server subprocess: read frames from shared memory.
+
+    Polls the seqlock counter.  When a new frame arrives, does numpy
+    reshape/flip/scale and publishes to the in-process frame bridge
+    for CameraTrack to pick up.
+    """
+    import numpy as np
+    from multiprocessing.shared_memory import SharedMemory
+
+    parent_pid = os.getppid()
+    log = logging.getLogger("ui_stream.shm_reader")
+    shm = SharedMemory(name=_SHM_NAME, create=False)
+    last_seq = 0
+
+    log.info("shm reader started (parent PID %d, scale=%.2f)", parent_pid, scale_val)
+
+    try:
+        while True:
+            # Exit if parent (UI process) died
+            if os.getppid() != parent_pid:
+                log.info("Parent process exited, shutting down")
+                break
+
+            # Read seqlock
+            seq = struct.unpack_from('I', shm.buf, 0)[0]
+            if seq == last_seq or seq % 2 != 0:
+                time.sleep(0.01)
+                continue
+
+            w, h = struct.unpack_from('II', shm.buf, 4)
+            if w <= 0 or h <= 0:
+                time.sleep(0.01)
+                continue
+
+            data_size = w * h * 4
+            raw = bytes(shm.buf[_SHM_HEADER:_SHM_HEADER + data_size])
+
+            # Verify no torn read
+            seq2 = struct.unpack_from('I', shm.buf, 0)[0]
+            if seq != seq2:
+                continue
+
+            last_seq = seq
+
+            # Numpy processing — all in this subprocess, not in UI process
+            arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 4))
+            rgb = arr[::-1, :, :3]  # flip vertically, drop alpha
+
+            if 0 < scale_val < 1:
+                step = max(1, int(round(1.0 / scale_val)))
+                rgb = rgb[::step, ::step, :]
+                h, w = rgb.shape[0], rgb.shape[1]
+
+            if h % 2 != 0:
+                rgb = rgb[:h - 1, :, :]
+                h -= 1
+            if w % 2 != 0:
+                rgb = rgb[:, :w - 1, :]
+                w -= 1
+
+            rgb = np.ascontiguousarray(rgb)
+            publish_frame(rgb, w, h)
+
+            # Update viewers flag for UI process
+            _update_viewers_shm()
+
+            time.sleep(0.01)  # ~100Hz poll; actual rate limited by capture side
+    finally:
+        shm.close()
+        log.info("shm reader stopped")
+
+
+# ---------------------------------------------------------------------------
+# Server entry point
+# ---------------------------------------------------------------------------
+
+def run_server(host="0.0.0.0", port=8082, fps=10, scale=0.5, server_mode=False):
+    """Start the aiohttp/WebRTC server (blocking).
+
+    In server_mode (subprocess), also starts the shared memory frame reader.
+    """
+    global _server_shm
     os.environ["STREAM_FPS"] = str(fps)
 
-    # Log to file since UI process stderr isn't easily accessible
     _fh = logging.FileHandler("/tmp/ui_stream.log")
     _fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     logging.root.addHandler(_fh)
     logging.root.setLevel(logging.INFO)
-    logger.info("Starting UI WebRTC server on %s:%s at %s fps (scale=%s)", host, port, fps, os.getenv("STREAM_SCALE", "0.5"))
+    logger.info("Starting UI WebRTC server on %s:%s at %s fps (scale=%s, server_mode=%s)",
+                host, port, fps, scale, server_mode)
+
+    if server_mode:
+        from multiprocessing.shared_memory import SharedMemory
+        _server_shm = SharedMemory(name=_SHM_NAME, create=False)
+        # Set viewers=1 initially so UI starts capturing while we set up
+        _server_shm.buf[12] = 1
+        reader = threading.Thread(
+            target=_shm_frame_reader, args=(float(scale),),
+            daemon=True, name="shm-reader"
+        )
+        reader.start()
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -853,8 +970,6 @@ def run_server(host="0.0.0.0", port=8082, fps=10):
     site = web.TCPSite(runner, host, port)
     loop.run_until_complete(site.start())
 
-    # Start telemetry collector (reads cereal → pushes to SSE clients)
-    import threading
     tc = threading.Thread(target=_telemetry_collector, daemon=True, name="telemetry-collector")
     tc.start()
 
@@ -864,8 +979,10 @@ def run_server(host="0.0.0.0", port=8082, fps=10):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Comma UI WebRTC streamer")
+    parser.add_argument("--server", action="store_true", help="Run as server subprocess")
     parser.add_argument("--host", default=os.getenv("STREAM_HOST", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=int(os.getenv("STREAM_PORT", "8082")))
-    parser.add_argument("--fps", type=int, default=int(os.getenv("STREAM_FPS", "10")))
+    parser.add_argument("--fps", type=int, default=int(os.getenv("STREAM_FPS", "5")))
+    parser.add_argument("--scale", type=float, default=float(os.getenv("STREAM_SCALE", "0.5")))
     args = parser.parse_args()
-    run_server(args.host, args.port, args.fps)
+    run_server(args.host, args.port, args.fps, scale=args.scale, server_mode=args.server)
